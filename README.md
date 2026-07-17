@@ -1,142 +1,221 @@
-<div align="center">
-<h1>VGGT-&Omega;</h1>
+# multiframe_merging
 
-<a href="http://vggt-omega.github.io/" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/Project_Page-green" alt="Project Page"></a>
-<a href="https://arxiv.org/abs/2605.15195" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/arXiv-2605.15195-b31b1b" alt="arXiv"></a>
-<a href="https://huggingface.co/spaces/facebook/vggt-omega"><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Demo-blue'></a>
+This repository contains an accelerated VGGT-Omega variant for long-sequence
+4D reconstruction.  The main idea is to reduce redundant computation inside the
+VGGT-Omega aggregator with two complementary mechanisms:
 
-<p>
-  <span class="author"><a href="https://jytime.github.io/">Jianyuan Wang</a><sup>1,2</sup></span>
-  <span class="author"><a href="https://silent-chen.github.io/">Minghao Chen</a><sup>1</sup></span>
-  <span class="author"><a href="https://scholar.google.com/citations?user=FUDsZkEAAAAJ&amp;hl=zh-CN">Shangzhan Zhang</a><sup>1</sup></span>
-  <span class="author"><a href="https://nikitakaraevv.github.io/">Nikita Karaev</a><sup>1</sup></span>
-  <br>
-  <span class="author"><a href="https://demuc.de/">Johannes Schönberger</a><sup>2</sup></span>
-  <span class="author"><a href="https://scholar.google.com/citations?user=IJidh-UAAAAJ&amp;hl=fr">Patrick Labatut</a><sup>2</sup></span>
-  <span class="author"><a href="https://scholar.google.com/citations?user=lJ_oh2EAAAAJ&amp;hl=en">Piotr Bojanowski</a><sup>2</sup></span>
-  <span class="author"><a href="https://d-novotny.github.io/">David Novotny</a></span>
-  <br>
-  <span class="author"><a href="https://www.robots.ox.ac.uk/~vedaldi/">Andrea Vedaldi</a><sup>1,2</sup></span>
-  <span class="author"><a href="https://chrirupp.github.io/">Christian Rupprecht</a><sup>1</sup></span>
-</p>
+- **Multi-frame merging**: merge visually redundant frames before global
+  inter-frame attention, keep an inverse map, and restore the full frame count
+  at a configurable layer.
+- **FastVGGT-style spatial token merging**: at each global inter-frame attention
+  layer, merge patch tokens and unmerge them after attention.
 
-**<sup>1</sup>[Visual Geometry Group, University of Oxford](https://www.robots.ox.ac.uk/~vgg/)**; **<sup>2</sup>[Meta AI](https://ai.facebook.com/research/)**
-</div>
+The implementation keeps the original VGGT-Omega model interface and adds
+runtime switches for frame merging, global-cluster frame grouping, token merging
+statistics, and frame-group export.
 
-## Pretrained models
+## Repository Layout
 
-Before using the models, please request access to the checkpoints [here](https://huggingface.co/facebook/VGGT-Omega). Once your request is approved, you can download the checkpoints. Please note that access requests are reviewed by an automated process based on the information provided in the request.
+```text
+vggt_omega/models/aggregator.py        # frame merging and aggregator logic
+vggt_omega/models/layers/attention.py  # FastVGGT-style token merge/unmerge
+inference/infer.py                     # TUM / 7scenes / Sintel / Bonn evaluation CLI
+scripts/run_multiframe_merging_eval.sh # main reproducible evaluation entry
+scripts/run_global_cluster_sweep.sh    # global-cluster frame-merging ablation
+scripts/export_frame_merge_groups.py   # export merged frame groups to JSON/CSV
+```
 
-| Model | Resolution | Text alignment | Download |
-| :--- | :--- | :--- | :--- |
-| `VGGT-Omega-1B-512` | 512 | No | [Link](https://huggingface.co/facebook/VGGT-Omega/blob/main/vggt_omega_1b_512.pt) |
-| `VGGT-Omega-1B-256-Text-Alignment` | 256 | Yes | [Link](https://huggingface.co/facebook/VGGT-Omega/blob/main/vggt_omega_1b_256_text.pt) |
+Generated outputs, checkpoints, and experiment logs are ignored by git.
 
-The authors are not involved in the review process and cannot approve or reject individual applications. However, the [🤗 Hugging Face demo](https://huggingface.co/spaces/facebook/vggt-omega) is available to everyone.
-
-
-## Quick Start
-
-First, clone this repository and install the dependencies:
+## Installation
 
 ```bash
-git clone git@github.com:facebookresearch/vggt-omega.git
-cd vggt-omega
+git clone <your-github-url>/multiframe_merging.git
+cd multiframe_merging
 pip install -r requirements.txt
 pip install -e .
 ```
 
+Download the VGGT-Omega checkpoint and place it at:
 
-Now, try the model with a few lines of code:
-
-```python
-import torch
-
-from vggt_omega.models import VGGTOmega
-from vggt_omega.utils.load_fn import load_and_preprocess_images
-from vggt_omega.utils.pose_enc import encoding_to_camera
-
-checkpoint_path = "path/to/vggt_omega_1b_512.pt"
-image_names = ["path/to/imageA.png", "path/to/imageB.png", "path/to/imageC.png"]
-
-model = VGGTOmega().to("cuda").eval()
-model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
-
-images = load_and_preprocess_images(image_names, image_resolution=512).to("cuda")
-
-with torch.inference_mode():
-    predictions = model(images)
-
-extrinsics, intrinsics = encoding_to_camera(
-    predictions["pose_enc"],
-    predictions["images"].shape[-2:],
-)
-
-depth = predictions["depth"]
-depth_conf = predictions["depth_conf"]
-camera_and_register_tokens = predictions["camera_and_register_tokens"]
-camera_tokens = camera_and_register_tokens[:, :, :1]
-registers = camera_and_register_tokens[:, :, 1:]
+```text
+checkpoints/vggt_omega_1b_512.pt
 ```
 
-For the text-aligned checkpoint, use `VGGTOmega(enable_alignment=True)` with `image_resolution=256` and read `predictions["text_alignment_embedding"]`.
+You can also pass another checkpoint with `CHECKPOINT=/path/to/model.pt`.
 
+## Datasets
 
-## Interactive Demo
+The evaluation scripts expect these default dataset locations:
 
-Install the demo dependencies:
+```text
+/data/mmc_syang/dataset/TUM-Dynamics
+/data/mmc_syang/dataset/7scenes/test
+```
+
+For 7Scenes, the code uses only the prepared test split directory.  Override it
+with:
 
 ```bash
-pip install -r requirements_demo.txt
+SEVEN_SCENES_ROOT=/path/to/7scenes/test
 ```
 
-Launch the Gradio demo with a local checkpoint path:
+All reported long-sequence experiments use `MAX_FRAMES=300`.
+
+## Main Method
+
+Run multi-frame merging plus FastVGGT-style spatial token merging:
 
 ```bash
-python demo_gradio.py \
-  --checkpoint checkpoints/VGGT-Omega-1B-512/model.pt \
-  --image-resolution 512
+GPU=0 PYTHON=/path/to/python \
+RESTORE_LAYER=24 \
+PAIR_THRESHOLD=0.98 \
+SPAN_THRESHOLD=0.95 \
+MAX_GROUP_SIZE=4 \
+scripts/run_multiframe_merging_eval.sh \
+  tum_dynamic \
+  tum300_multiframe_max4_pair098_span095_restore24
 ```
 
-The demo accepts uploaded images or a video, runs camera and depth inference,
-and visualizes the depth-unprojected point cloud and predicted cameras as a GLB
-scene.
+For 7Scenes:
 
-## Runtime and GPU Memory
-
-We benchmark the end-to-end peak GPU memory usage of `VGGT-Omega-1B-512` on a
-single NVIDIA A100 GPU with 624x416 input images. The measurement covers the full
-inference program, from loading the model weights onto the GPU through the
-forward pass, so it includes both the memory needed to store the model itself
-and the memory used by inference activations and buffers. In other words, a GPU
-with at least the listed available memory is able to run the corresponding
-number of input frames under this setup.
-
-| **Input Frames** | 1 | 10 | 25 | 50 | 100 | 200 | 300 | 400 | 500 |
-|:----------------:|:-:|:--:|:--:|:--:|:---:|:---:|:---:|:---:|:---:|
-| **Peak Memory (GB)** | 6.02 | 6.67 | 7.80 | 9.66 | 13.37 | 20.82 | 28.26 | 35.71 | 43.15 |
-
-The benchmark uses [`load_and_preprocess_images`](./vggt_omega/utils/load_fn.py)
-with the default `mode="balanced"` and `image_resolution=512`. For these roughly
-3:2 landscape images, this produces 624x416 inputs. You can set
-`mode="max_size"` to resize the longest side to 512 instead; for the same aspect
-ratio, this gives about 512x336 inputs and uses less GPU memory.
-
-## License
-
-See the [LICENSE](./LICENSE) file for details about the license under which
-this code is made available.
-
-[^release]: This Release is intended to support the open source research community.
-
-```bibtex
-@misc{wang2026vggtomega,
-      title={VGGT-$\Omega$}, 
-      author={Jianyuan Wang and Minghao Chen and Shangzhan Zhang and Nikita Karaev and Johannes Schönberger and Patrick Labatut and Piotr Bojanowski and David Novotny and Andrea Vedaldi and Christian Rupprecht},
-      year={2026},
-      eprint={2605.15195},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2605.15195}, 
-}
+```bash
+GPU=0 PYTHON=/path/to/python \
+RESTORE_LAYER=24 \
+PAIR_THRESHOLD=0.98 \
+SPAN_THRESHOLD=0.95 \
+MAX_GROUP_SIZE=4 \
+scripts/run_multiframe_merging_eval.sh \
+  7scenes \
+  7scenes_test300_multiframe_max4_pair098_span095_restore24
 ```
+
+Useful environment variables:
+
+```text
+GPU                  CUDA device id
+PYTHON               Python executable
+CHECKPOINT           VGGT-Omega checkpoint path
+MAX_FRAMES           frames per sequence, default 300
+TOKEN_MERGING_RATIO  FastVGGT merge-away ratio, default 0.9
+RESTORE_LAYER        layer where merged frames are restored
+PAIR_THRESHOLD       adjacent-frame similarity threshold for multi-frame groups
+SPAN_THRESHOLD       first-last similarity threshold for multi-frame groups
+MAX_GROUP_SIZE       maximum frames per multi-frame group
+MAX_WINDOW           max segment length, default 20
+POOL_STRIDE          pooling stride for frame-similarity descriptors
+```
+
+## Global Cluster Ablation
+
+The global-cluster ablation ignores temporal order and clusters visually similar
+frames subject to a minimum similarity threshold and maximum cluster size:
+
+```bash
+GPU=0 PYTHON=/path/to/python scripts/run_global_cluster_sweep.sh
+```
+
+By default this runs three TUM settings:
+
+```text
+threshold=0.98, max_group_size=4
+threshold=0.95, max_group_size=3
+threshold=0.98, max_group_size=3
+```
+
+Run a single setting:
+
+```bash
+GPU=0 scripts/run_global_cluster_sweep.sh 0.98 3
+```
+
+Each run exports the concrete frame clusters to:
+
+```text
+outputs/<run>/<dataset>/_frame_merge_groups.json
+outputs/<run>/<dataset>/_frame_merge_groups.csv
+```
+
+The CSV contains rows such as:
+
+```text
+sequence,event,block,strategy,batch,group,size,frames
+rgbd_dataset_freiburg3_walking_xyz,0,0,global_cluster,0,12,3,"4 19 82"
+```
+
+## Important CLI Options
+
+The core implementation is exposed through `inference/infer.py`:
+
+```bash
+python inference/infer.py \
+  --dataset tum_dynamic \
+  --output-dir outputs/example \
+  --max-frames-per-seq 300 \
+  --window-size 0 \
+  --checkpoint checkpoints/vggt_omega_1b_512.pt \
+  --eval \
+  --enable-token-merging \
+  --token-merging-method frame_persistent_spatial \
+  --token-merging-ratio 0.9 \
+  --token-merging-start 0 \
+  --token-merging-frame-restore-layer 24 \
+  --token-merging-frame-group-strategy local \
+  --token-merging-frame-multi-max-group-size 4 \
+  --token-merging-frame-multi-pair-threshold 0.98 \
+  --token-merging-frame-multi-span-threshold 0.95
+```
+
+Frame grouping strategies:
+
+```text
+local            streaming segmentation + local adjacent multi-frame groups
+segment_middle   merge the middle frames inside each segment
+global_cluster   cluster similar frames without temporal-order constraints
+```
+
+Token merging methods of interest:
+
+```text
+spatial                   FastVGGT-style spatial token merging only
+frame_persistent          persistent frame merging only
+frame_persistent_spatial  persistent frame merging + FastVGGT spatial merging
+```
+
+## Metrics
+
+Evaluation writes summary files under each output directory:
+
+```text
+_summary_scale_shift.json
+_summary_pose_auc.json
+_summary_complete_scale_shift.json
+```
+
+The main metrics used in our experiments are:
+
+```text
+Abs Rel
+delta < 1.25
+AUC@3
+AUC@30
+FPS
+```
+
+Per-sequence timing files also include frame-merge statistics:
+
+```text
+frame_merge_active_frames_mean
+frame_merge_merge_ratio_mean
+frame_merge_stats
+token_merging_full_attention_token_ratio_mean
+```
+
+When group export is enabled, `merge_groups` records exactly which original
+frame indices were fused into each active frame.
+
+## Notes
+
+- Checkpoints, datasets, and generated outputs are not included in this repo.
+- The code is based on VGGT-Omega and keeps the original license file.
+- `outputs/`, `checkpoints/`, and model weight files are ignored by `.gitignore`.
