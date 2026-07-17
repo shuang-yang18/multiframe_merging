@@ -30,7 +30,7 @@ Generated outputs, checkpoints, and experiment logs are ignored by git.
 ## Installation
 
 ```bash
-git clone <your-github-url>/multiframe_merging.git
+git clone https://github.com/shuang-yang18/multiframe_merging.git
 cd multiframe_merging
 pip install -r requirements.txt
 pip install -e .
