@@ -15,7 +15,7 @@ from vggt_omega.evaluation import preprocess_sintel_depth
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset-root", default="/data/mmc_syang/dataset/Sintel/training")
+    parser.add_argument("--dataset-root", default="datasets/Sintel/training")
     parser.add_argument("--output-csv", default="outputs/video_depth_uniform_gpu2_summary_scale_shift.csv")
     parser.add_argument("--align", choices=["metric", "scale", "scale_shift"], default="scale_shift")
     parser.add_argument("runs", nargs="+", help="Entries formatted as label=prediction_dir")

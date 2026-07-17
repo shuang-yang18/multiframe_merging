@@ -42,22 +42,22 @@ Download the VGGT-Omega checkpoint and place it at:
 checkpoints/vggt_omega_1b_512.pt
 ```
 
-You can also pass another checkpoint with `CHECKPOINT=/path/to/model.pt`.
+You can also pass another checkpoint with `CHECKPOINT=checkpoints/your_model.pt`.
 
 ## Datasets
 
-The evaluation scripts expect these default dataset locations:
+The evaluation scripts use repository-relative dataset defaults:
 
 ```text
-/data/mmc_syang/dataset/TUM-Dynamics
-/data/mmc_syang/dataset/7scenes/test
+datasets/TUM-Dynamics
+datasets/7scenes/test
 ```
 
 For 7Scenes, the code uses only the prepared test split directory.  Override it
 with:
 
 ```bash
-SEVEN_SCENES_ROOT=/path/to/7scenes/test
+SEVEN_SCENES_ROOT=datasets/7scenes/test
 ```
 
 All reported long-sequence experiments use `MAX_FRAMES=300`.
@@ -67,7 +67,7 @@ All reported long-sequence experiments use `MAX_FRAMES=300`.
 Run multi-frame merging plus FastVGGT-style spatial token merging:
 
 ```bash
-GPU=0 PYTHON=/path/to/python \
+GPU=0 \
 RESTORE_LAYER=24 \
 PAIR_THRESHOLD=0.98 \
 SPAN_THRESHOLD=0.95 \
@@ -80,7 +80,7 @@ scripts/run_multiframe_merging_eval.sh \
 For 7Scenes:
 
 ```bash
-GPU=0 PYTHON=/path/to/python \
+GPU=0 \
 RESTORE_LAYER=24 \
 PAIR_THRESHOLD=0.98 \
 SPAN_THRESHOLD=0.95 \
@@ -112,7 +112,7 @@ The global-cluster ablation ignores temporal order and clusters visually similar
 frames subject to a minimum similarity threshold and maximum cluster size:
 
 ```bash
-GPU=0 PYTHON=/path/to/python scripts/run_global_cluster_sweep.sh
+GPU=0 scripts/run_global_cluster_sweep.sh
 ```
 
 By default this runs three TUM settings:

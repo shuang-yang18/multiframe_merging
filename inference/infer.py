@@ -30,10 +30,10 @@ BONN_SEQUENCES = [
     "rgbd_bonn_synchronous",
 ]
 DEFAULT_DATASET_ROOTS = {
-    "sintel": "/data/mmc_syang/dataset/Sintel/training",
-    "bonn": "/data/mmc_syang/dataset/Bonn/rgbd_bonn_dataset",
-    "7scenes": "/data/mmc_syang/dataset/7scenes",
-    "tum_dynamic": "/data/mmc_syang/dataset/TUM-Dynamics",
+    "sintel": "datasets/Sintel/training",
+    "bonn": "datasets/Bonn/rgbd_bonn_dataset",
+    "7scenes": "datasets/7scenes",
+    "tum_dynamic": "datasets/TUM-Dynamics",
 }
 
 

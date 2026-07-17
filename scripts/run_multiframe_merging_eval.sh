@@ -18,7 +18,7 @@ POOL_STRIDE="${POOL_STRIDE:-2}"
 EXTRA_ARGS=()
 if [[ "$DATASET" == "7scenes" ]]; then
   EXTRA_ARGS=(
-    --dataset-root "${SEVEN_SCENES_ROOT:-/data/mmc_syang/dataset/7scenes/test}"
+    --dataset-root "${SEVEN_SCENES_ROOT:-datasets/7scenes/test}"
     --seven-scenes-split test
   )
 fi
