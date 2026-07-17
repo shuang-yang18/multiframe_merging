@@ -24,6 +24,8 @@ if [[ "$DATASET" == "7scenes" ]]; then
 fi
 
 cd "$ROOT"
+export HF_HOME="${HF_HOME:-$ROOT/.cache/huggingface}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/hub}"
 echo "[$(date '+%F %T')] multiframe_merging dataset=${DATASET} output=${OUTPUT_NAME} gpu=${GPU}"
 echo "  ratio=${TOKEN_MERGING_RATIO} max_group=${MAX_GROUP_SIZE} pair=${PAIR_THRESHOLD} span=${SPAN_THRESHOLD} restore=${RESTORE_LAYER}"
 

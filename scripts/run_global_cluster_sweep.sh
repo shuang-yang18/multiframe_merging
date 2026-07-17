@@ -10,6 +10,8 @@ RESTORE_LAYER="${RESTORE_LAYER:-24}"
 TOKEN_MERGING_RATIO="${TOKEN_MERGING_RATIO:-0.9}"
 
 cd "$ROOT"
+export HF_HOME="${HF_HOME:-$ROOT/.cache/huggingface}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/hub}"
 
 run_one() {
   local threshold="$1"
