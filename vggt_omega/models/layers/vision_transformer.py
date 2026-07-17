@@ -232,12 +232,20 @@ class DinoVisionTransformer(nn.Module):
             t2_x, hw_tuple = self.prepare_tokens_with_masks(t_x, t_masks)
             x.append(t2_x)
             rope.append(hw_tuple)
-        for _, blk in enumerate(self.blocks):
+        last_cls_attention = None
+        for block_idx, blk in enumerate(self.blocks):
             if self.rope_embed is not None:
                 rope_sincos = [self.rope_embed(H=H, W=W) for H, W in rope]
             else:
                 rope_sincos = [None for r in rope]
+            capture_cls_attention = block_idx == len(self.blocks) - 1 and len(x) == 1
+            if capture_cls_attention:
+                blk.attn.capture_cls_attention = True
+                blk.attn.last_cls_attention = None
             x = blk(x, rope_sincos)
+            if capture_cls_attention:
+                last_cls_attention = blk.attn.last_cls_attention
+                blk.attn.capture_cls_attention = False
         all_x = x
         output = []
         for idx, (x, masks) in enumerate(zip(all_x, masks_list)):
@@ -260,6 +268,9 @@ class DinoVisionTransformer(nn.Module):
                     "x_norm_clstoken": x_norm_cls_reg[:, 0],
                     "x_storage_tokens": x_norm_cls_reg[:, 1:],
                     "x_norm_patchtokens": x_norm_patch,
+                    "x_cls_attention": None
+                    if last_cls_attention is None
+                    else last_cls_attention[:, self.n_storage_tokens + 1 :],
                     "x_prenorm": x,
                     "masks": masks,
                 }

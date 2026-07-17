@@ -23,21 +23,70 @@ class VGGTOmega(nn.Module):
         enable_camera: bool = True,
         enable_depth: bool = True,
         enable_alignment: bool = False,
+        register_attention_block_indices: list[int] | None = None,
+        enable_token_merging: bool = False,
+        token_merging_start: int = 0,
+        token_merging_ratio: float = 0.9,
+        token_merging_method: str = "spatial",
+        token_merging_tstm_threshold: float = 0.8,
+        token_merging_tstm_neighbor_size: int = 3,
+        token_merging_flashvid_alpha: float = 0.7,
+        token_merging_flashvid_expansion: float = 1.25,
+        token_merging_flashvid_pool_stride: int = 2,
+        token_merging_frame_restore_layer: int = 16,
+        token_merging_frame_alpha: float = 0.9,
+        token_merging_frame_segment_threshold: float = 0.8,
+        token_merging_frame_merge_threshold: float = 0.8,
+        token_merging_frame_max_window: int = 6,
+        token_merging_frame_pool_stride: int = 2,
+        token_merging_frame_multi_max_group_size: int = 2,
+        token_merging_frame_multi_pair_threshold: float = 0.95,
+        token_merging_frame_multi_span_threshold: float = 0.93,
+        token_merging_frame_group_strategy: str = "local",
+        **unused_kwargs,
     ) -> None:
         super().__init__()
+        if unused_kwargs:
+            warnings.warn(
+                f"Ignoring unsupported VGGTOmega options: {sorted(unused_kwargs)}",
+                stacklevel=2,
+            )
 
-        self.aggregator = Aggregator(patch_size=patch_size, embed_dim=embed_dim)
+        self.aggregator = Aggregator(
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            register_attention_block_indices=register_attention_block_indices,
+            enable_token_merging=enable_token_merging,
+            token_merging_start=token_merging_start,
+            token_merging_ratio=token_merging_ratio,
+            token_merging_method=token_merging_method,
+            token_merging_tstm_threshold=token_merging_tstm_threshold,
+            token_merging_tstm_neighbor_size=token_merging_tstm_neighbor_size,
+            token_merging_flashvid_alpha=token_merging_flashvid_alpha,
+            token_merging_flashvid_expansion=token_merging_flashvid_expansion,
+            token_merging_flashvid_pool_stride=token_merging_flashvid_pool_stride,
+            token_merging_frame_restore_layer=token_merging_frame_restore_layer,
+            token_merging_frame_alpha=token_merging_frame_alpha,
+            token_merging_frame_segment_threshold=token_merging_frame_segment_threshold,
+            token_merging_frame_merge_threshold=token_merging_frame_merge_threshold,
+            token_merging_frame_max_window=token_merging_frame_max_window,
+            token_merging_frame_pool_stride=token_merging_frame_pool_stride,
+            token_merging_frame_multi_max_group_size=token_merging_frame_multi_max_group_size,
+            token_merging_frame_multi_pair_threshold=token_merging_frame_multi_pair_threshold,
+            token_merging_frame_multi_span_threshold=token_merging_frame_multi_span_threshold,
+            token_merging_frame_group_strategy=token_merging_frame_group_strategy,
+        )
         _warn_if_rope_not_max(self.aggregator)
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
         self.dense_head = DenseHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_depth else None
         self.text_alignment_head = TextAlignmentHead(dim_in=2 * embed_dim) if enable_alignment else None
 
-    def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(self, images: torch.Tensor, use_amp: bool = True) -> dict[str, torch.Tensor]:
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
 
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        with torch.autocast(device_type="cuda", dtype=amp_dtype):
+        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp and images.is_cuda):
             aggregated_tokens_list, patch_token_start = self.aggregator(images)
 
         final_tokens = aggregated_tokens_list[-1]
@@ -70,6 +119,13 @@ class VGGTOmega(nn.Module):
                         patch_token_start=patch_token_start,
                     )
                 )
+
+        frame_merge_stats = getattr(self.aggregator, "last_frame_merge_stats", None)
+        if frame_merge_stats:
+            predictions["frame_merge_stats"] = frame_merge_stats
+        token_merging_stats = getattr(self.aggregator, "last_token_merging_stats", None)
+        if token_merging_stats:
+            predictions["token_merging_stats"] = token_merging_stats
 
         if not self.training:
             predictions["images"] = images
