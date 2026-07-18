@@ -393,6 +393,14 @@ def infer_sequence(
         active_tokens = [float(stat["active_tokens"]) for stat in token_merging_stats]
         token_ratios = [float(stat["full_attention_token_ratio"]) for stat in token_merging_stats]
         merged_ratios = [float(stat["merged_away_token_ratio"]) for stat in token_merging_stats]
+        active_over_frame_merged_ratios = [
+            float(stat.get("active_over_frame_merged_token_ratio", stat["full_attention_token_ratio"]))
+            for stat in token_merging_stats
+        ]
+        active_over_frame_original_ratios = [
+            float(stat.get("active_over_frame_original_token_ratio", stat["full_attention_token_ratio"]))
+            for stat in token_merging_stats
+        ]
         speed_metrics.update(
             {
                 "token_merging_events": len(token_merging_stats),
@@ -400,6 +408,14 @@ def infer_sequence(
                 "token_merging_active_tokens_mean": sum(active_tokens) / len(active_tokens),
                 "token_merging_full_attention_token_ratio_mean": sum(token_ratios) / len(token_ratios),
                 "token_merging_merged_away_token_ratio_mean": sum(merged_ratios) / len(merged_ratios),
+                "token_merging_active_over_frame_merged_token_ratio_mean": sum(
+                    active_over_frame_merged_ratios
+                )
+                / len(active_over_frame_merged_ratios),
+                "token_merging_active_over_frame_original_token_ratio_mean": sum(
+                    active_over_frame_original_ratios
+                )
+                / len(active_over_frame_original_ratios),
                 "token_merging_stats": token_merging_stats,
             }
         )

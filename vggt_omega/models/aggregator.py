@@ -259,6 +259,7 @@ class Aggregator(nn.Module):
                 tokens,
                 batch_size,
                 active_num_frames,
+                num_frames,
                 num_tokens,
                 embed_dim,
                 block_idx,
@@ -324,6 +325,7 @@ class Aggregator(nn.Module):
         tokens: torch.Tensor,
         batch_size: int,
         num_frames: int,
+        original_num_frames: int,
         num_tokens: int,
         embed_dim: int,
         block_idx: int,
@@ -407,10 +409,21 @@ class Aggregator(nn.Module):
                     tokens = block(tokens, None)
                     stats = getattr(block.attn, "last_fastvggt_stats", None)
                     if stats:
+                        active_tokens = int(stats["active_tokens"])
+                        frame_merged_tokens = int(stats["original_tokens"])
+                        frame_original_tokens = int(original_num_frames * num_tokens)
                         self.last_token_merging_stats.append(
                             {
                                 "block": int(block_idx),
                                 "mode": self.token_merging_method,
+                                "frame_merged_tokens": frame_merged_tokens,
+                                "frame_original_tokens": frame_original_tokens,
+                                "active_over_frame_merged_token_ratio": float(
+                                    active_tokens / frame_merged_tokens if frame_merged_tokens else 0.0
+                                ),
+                                "active_over_frame_original_token_ratio": float(
+                                    active_tokens / frame_original_tokens if frame_original_tokens else 0.0
+                                ),
                                 **stats,
                             }
                         )
