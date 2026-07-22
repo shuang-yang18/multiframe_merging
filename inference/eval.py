@@ -34,8 +34,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pose-eval-frames",
         type=int,
-        default=10,
-        help="Paper-style pose AUC frame sampling. Defaults to 10 random frames per sequence; use 0 for all frames.",
+        default=0,
+        help=(
+            "Number of frames to sample only for pose AUC. Default 0 evaluates all inferred frames; "
+            "for paper-style 10-view VGGT evaluation, run inference with 10 input frames instead of "
+            "subsampling a longer prediction afterward."
+        ),
     )
     parser.add_argument("--pose-eval-seed", type=int, default=0, help="Seed for deterministic pose-AUC frame sampling.")
     parser.add_argument("--all-scenes", action="store_true", default=True, help="Evaluate every scene available in the dataset root.")

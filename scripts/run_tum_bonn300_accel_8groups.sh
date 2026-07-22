@@ -12,7 +12,7 @@ SPARSE_REPO="${SPARSE_REPO:-/data/mmc_syang/sparse-vggt}"
 BONN_ROOT="${BONN_ROOT:-datasets/Bonn/rgbd_bonn_dataset}"
 TUM_ROOT="${TUM_ROOT:-datasets/TUM-Dynamics}"
 MAX_FRAMES="${MAX_FRAMES:-300}"
-POSE_EVAL_FRAMES="${POSE_EVAL_FRAMES:-10}"
+POSE_EVAL_FRAMES="${POSE_EVAL_FRAMES:-0}"
 POSE_EVAL_SEED="${POSE_EVAL_SEED:-0}"
 OVERWRITE="${OVERWRITE:-1}"
 

@@ -12,9 +12,11 @@ dist/
 outputs/
 new_results/
 layerwise_results/
+auc_eval_results/
 demo_outputs/
 checkpoints/
 datasets
+vggtΩ.pdf
 skyseg.onnx
 skyseg.onnx.tmp
 *.pt

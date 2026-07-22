@@ -62,10 +62,11 @@ SEVEN_SCENES_ROOT=datasets/7scenes/test
 
 All reported long-sequence experiments use `MAX_FRAMES=300`.
 
-Pose AUC follows the paper-style default protocol: each sequence samples 10
-frames with a deterministic seed (`--pose-eval-frames 10 --pose-eval-seed 0`).
-Set `--pose-eval-frames 0` only when you intentionally want full-frame AUC for
-analysis.
+Pose AUC follows the official VGGT relative-pose protocol: convert camera poses
+to world-to-camera SE(3), evaluate all frame pairs, use the maximum of rotation
+and translation-direction errors, and compute histogram cumulative AUC. For
+long-sequence experiments, `--pose-eval-frames 0` keeps all inferred frames. To
+run the paper's 10-view setting, sample 10 input frames before inference.
 
 ## Main Method
 
