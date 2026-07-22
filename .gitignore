@@ -10,6 +10,8 @@ venv/
 build/
 dist/
 outputs/
+new_results/
+layerwise_results/
 demo_outputs/
 checkpoints/
 datasets

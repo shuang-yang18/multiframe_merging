@@ -14,21 +14,30 @@ from vggt_omega.evaluation import preprocess_depth as preprocess_raw_depth
 from vggt_omega.evaluation import preprocess_bonn_depth, preprocess_sintel_depth, write_csv
 
 if __package__:
-    from .infer import DEFAULT_DATASET_ROOTS, sequence_images, sequence_names
-    from .pose_auc import summarize_pose_auc, write_json
+    from .infer import DEFAULT_DATASET_ROOTS, sequence_images, sequence_names, sequence_poses
+    from .pose_auc import evaluate_pose_auc, summarize_pose_auc, write_json
 else:
-    from infer import DEFAULT_DATASET_ROOTS, sequence_images, sequence_names
-    from pose_auc import summarize_pose_auc, write_json
+    from infer import DEFAULT_DATASET_ROOTS, sequence_images, sequence_names, sequence_poses
+    from pose_auc import evaluate_pose_auc, summarize_pose_auc, write_json
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=["sintel", "bonn", "7scenes", "tum_dynamic", "all"], default="all")
     parser.add_argument("--dataset-root")
+    parser.add_argument("--bonn-rgb-dir", default="rgb_110", help="Bonn RGB subdirectory; use 'rgb' for full-length sequences.")
+    parser.add_argument("--bonn-depth-dir", default="depth_110", help="Bonn depth subdirectory; use 'depth' for full-length sequences.")
     parser.add_argument("--pred-dir", default="outputs/video_depth")
     parser.add_argument("--output-dir", default="outputs/video_depth")
     parser.add_argument("--align", choices=["metric", "scale", "scale_shift"], default="scale_shift")
     parser.add_argument("--max-depth", type=float, default=70.0)
+    parser.add_argument(
+        "--pose-eval-frames",
+        type=int,
+        default=10,
+        help="Paper-style pose AUC frame sampling. Defaults to 10 random frames per sequence; use 0 for all frames.",
+    )
+    parser.add_argument("--pose-eval-seed", type=int, default=0, help="Seed for deterministic pose-AUC frame sampling.")
     parser.add_argument("--all-scenes", action="store_true", default=True, help="Evaluate every scene available in the dataset root.")
     parser.add_argument("--sequences", nargs="*")
     parser.add_argument(
@@ -79,15 +88,21 @@ def _associate_tum_depths(dataset_root: str | Path, seq: str, image_paths: list[
     return matched
 
 
-def sequence_depths(dataset: str, dataset_root: str | Path, seq: str) -> list[str]:
+def sequence_depths(
+    dataset: str,
+    dataset_root: str | Path,
+    seq: str,
+    bonn_depth_dir: str = "depth_110",
+    bonn_rgb_dir: str = "rgb_110",
+) -> list[str]:
     if dataset == "sintel":
         paths = sorted((Path(dataset_root) / "depth" / seq).glob("*.dpt"))
     elif dataset == "7scenes":
         paths = sorted((Path(dataset_root) / seq).glob("*.depth.png"))
     elif dataset == "tum_dynamic":
-        return _associate_tum_depths(dataset_root, seq, sequence_images(dataset, dataset_root, seq))
+        return _associate_tum_depths(dataset_root, seq, sequence_images(dataset, dataset_root, seq, bonn_rgb_dir))
     else:
-        paths = sorted((Path(dataset_root) / seq / "depth_110").glob("*.png"))
+        paths = sorted((Path(dataset_root) / seq / bonn_depth_dir).glob("*.png"))
     if not paths:
         raise FileNotFoundError(f"No {dataset} ground truth depths found for sequence {seq}")
     return [str(path) for path in paths]
@@ -169,13 +184,17 @@ def evaluate_dataset(args: argparse.Namespace, dataset: str) -> dict:
         args.sequences,
         args.all_scenes,
         args.seven_scenes_split,
+        args.bonn_rgb_dir,
     )
     pred_root = Path(args.pred_dir) / dataset
     sequence_rows = []
 
     for seq in sequences:
-        images = limit_frames(sequence_images(dataset, dataset_root, seq), args.max_frames_per_seq)
-        gt_paths = limit_frames(sequence_depths(dataset, dataset_root, seq), args.max_frames_per_seq)
+        images = limit_frames(sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir), args.max_frames_per_seq)
+        gt_paths = limit_frames(
+            sequence_depths(dataset, dataset_root, seq, args.bonn_depth_dir, args.bonn_rgb_dir),
+            args.max_frames_per_seq,
+        )
         pred_paths = sorted((pred_root / seq).glob("frame_*.npy"))
         if not (len(pred_paths) == len(gt_paths) == len(images)):
             raise ValueError(
@@ -329,7 +348,22 @@ def evaluate_dataset(args: argparse.Namespace, dataset: str) -> dict:
     pred_root = Path(args.pred_dir) / dataset
     for seq in sequences:
         pose_path = pred_root / seq / "_pose_auc.json"
-        if pose_path.is_file():
+        pred_pose_path = pred_root / seq / "pred_poses.npy"
+        images = limit_frames(sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir), args.max_frames_per_seq)
+        gt_poses = sequence_poses(dataset, dataset_root, seq, len(images), images)
+        if pred_pose_path.is_file() and gt_poses is not None:
+            pred_poses = np.load(pred_pose_path)
+            row = evaluate_pose_auc(
+                pred_poses,
+                gt_poses,
+                num_frames=args.pose_eval_frames,
+                seed=args.pose_eval_seed,
+                sequence=seq,
+            )
+            write_json(pose_path, row)
+            row["sequence"] = seq
+            pose_rows.append(row)
+        elif pose_path.is_file():
             with pose_path.open() as handle:
                 row = json.load(handle)
             row["sequence"] = seq

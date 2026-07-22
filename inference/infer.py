@@ -41,6 +41,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=["sintel", "bonn", "7scenes", "tum_dynamic", "all"], default="all")
     parser.add_argument("--dataset-root")
+    parser.add_argument("--bonn-rgb-dir", default="rgb_110", help="Bonn RGB subdirectory; use 'rgb' for full-length sequences.")
+    parser.add_argument("--bonn-depth-dir", default="depth_110", help="Bonn depth subdirectory; use 'depth' for full-length sequences.")
     parser.add_argument("--checkpoint", default="checkpoints/vggt_omega_1b_512.pt")
     parser.add_argument("--output-dir", default="outputs/video_depth")
     parser.add_argument("--device", default="cuda")
@@ -101,6 +103,11 @@ def parse_args() -> argparse.Namespace:
         help="Fraction of patch tokens to merge away inside global inter-frame attention; 0.9 keeps about 10%%.",
     )
     parser.add_argument(
+        "--token-merging-layer-ratios",
+        default="",
+        help="Optional 1-based layer schedule, e.g. '1-10:0.9,11-18:0.3,19-24:0.9'.",
+    )
+    parser.add_argument(
         "--token-merging-method",
         choices=[
             "spatial",
@@ -140,15 +147,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--token-merging-frame-multi-max-group-size", type=int, default=2)
     parser.add_argument("--token-merging-frame-multi-pair-threshold", type=float, default=0.95)
     parser.add_argument("--token-merging-frame-multi-span-threshold", type=float, default=0.93)
+    parser.add_argument("--token-merging-frame-protect-period", type=int, default=0)
+    parser.add_argument("--token-merging-frame-protect-prefix", type=int, default=0)
     parser.add_argument(
         "--token-merging-frame-group-strategy",
-        choices=["local", "segment_middle", "global_cluster"],
+        choices=["local", "segment_middle", "global_cluster", "global_top_pairs"],
         default="local",
         help="Frame grouping strategy inside each segment.",
     )
+    parser.add_argument(
+        "--omega-accelerator",
+        choices=["none", "da_vggt", "sparse_vggt"],
+        default="none",
+        help="Explicit external acceleration adapter; separate from the existing token-merging methods.",
+    )
+    parser.add_argument("--sparse-vggt-sparse-ratio", type=float, default=0.5)
+    parser.add_argument("--sparse-vggt-cdf-threshold", type=float)
+    parser.add_argument("--sparse-vggt-pool-mode", choices=["avg", "max"], default="avg")
+    parser.add_argument("--da-vggt-max-frames", type=int, default=0)
+    parser.add_argument("--da-vggt-sampling-method", choices=["fl_maxmin", "step"], default="fl_maxmin")
+    parser.add_argument("--da-vggt-n-anchors", type=int, default=1)
+    parser.add_argument("--da-vggt-dino-batch-size", type=int, default=256)
+    parser.add_argument("--da-vggt-lambda-div", type=float, default=0.0)
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--eval", action="store_true", help="Evaluate this prediction run immediately after inference.")
     parser.add_argument("--eval-align", choices=["metric", "scale", "scale_shift"], default="scale_shift")
+    parser.add_argument(
+        "--pose-eval-frames",
+        type=int,
+        default=10,
+        help="Paper-style pose AUC frame sampling. Defaults to 10 random frames per sequence; use 0 for all frames.",
+    )
+    parser.add_argument("--pose-eval-seed", type=int, default=0, help="Seed for deterministic pose-AUC frame sampling.")
     parser.add_argument("--max-depth", type=float, default=70.0)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--all-scenes", action="store_true", default=True, help="Run every scene available in the dataset root.")
@@ -219,6 +249,7 @@ def sequence_names(
     requested: list[str] | None,
     all_scenes: bool = False,
     seven_scenes_split: str = "test",
+    bonn_rgb_dir: str = "rgb_110",
 ) -> list[str]:
     if dataset == "sintel":
         if all_scenes and not requested:
@@ -249,16 +280,16 @@ def sequence_names(
             raise FileNotFoundError(f"Missing TUM-Dynamics rgb directories below {dataset_root}: {missing}")
         return requested
     if all_scenes and not requested:
-        requested = sorted(path.name for path in Path(dataset_root).iterdir() if (path / "rgb_110").is_dir())
+        requested = sorted(path.name for path in Path(dataset_root).iterdir() if (path / bonn_rgb_dir).is_dir())
     else:
         requested = requested or BONN_SEQUENCES
-    missing = [seq for seq in requested if not (Path(dataset_root) / seq / "rgb_110").is_dir()]
+    missing = [seq for seq in requested if not (Path(dataset_root) / seq / bonn_rgb_dir).is_dir()]
     if missing:
-        raise FileNotFoundError(f"Missing Bonn rgb_110 directories below {dataset_root}: {missing}")
+        raise FileNotFoundError(f"Missing Bonn {bonn_rgb_dir} directories below {dataset_root}: {missing}")
     return requested
 
 
-def sequence_images(dataset: str, dataset_root: str | Path, seq: str) -> list[str]:
+def sequence_images(dataset: str, dataset_root: str | Path, seq: str, bonn_rgb_dir: str = "rgb_110") -> list[str]:
     if dataset == "sintel":
         return sintel_sequence_images(dataset_root, seq)
     if dataset == "7scenes":
@@ -271,9 +302,9 @@ def sequence_images(dataset: str, dataset_root: str | Path, seq: str) -> list[st
         if not paths:
             raise FileNotFoundError(f"No TUM-Dynamics rgb images found for sequence {seq}")
         return [str(path) for path in paths]
-    paths = sorted((Path(dataset_root) / seq / "rgb_110").glob("*.png"))
+    paths = sorted((Path(dataset_root) / seq / bonn_rgb_dir).glob("*.png"))
     if not paths:
-        raise FileNotFoundError(f"No Bonn input images found for sequence {seq}")
+        raise FileNotFoundError(f"No Bonn input images found for sequence {seq} in {bonn_rgb_dir}")
     return [str(path) for path in paths]
 
 
@@ -337,6 +368,33 @@ def save_tum_trajectory(path: Path, poses: np.ndarray) -> None:
             handle.write(f"{index} {x} {y} {z} {qx} {qy} {qz} {qw}\n")
 
 
+def save_frame_similarity_matrices(output_dir: Path, speed_metrics: dict) -> list[str]:
+    saved_paths: list[str] = []
+    frame_merge_stats = speed_metrics.get("frame_merge_stats")
+    if not isinstance(frame_merge_stats, list):
+        return saved_paths
+    for event_idx, stat in enumerate(frame_merge_stats):
+        if not isinstance(stat, dict):
+            continue
+        matrices = stat.pop("similarity_matrices", None)
+        if not matrices:
+            continue
+        event_paths = []
+        for batch_idx, matrix in enumerate(matrices):
+            suffix = f"event{event_idx:03d}"
+            if len(matrices) > 1:
+                suffix = f"{suffix}_batch{batch_idx:03d}"
+            matrix_array = np.asarray(matrix, dtype=np.float32)
+            npy_path = output_dir / f"similarity_matrix_{suffix}.npy"
+            csv_path = output_dir / f"similarity_matrix_{suffix}.csv"
+            np.save(npy_path, matrix_array)
+            np.savetxt(csv_path, matrix_array, delimiter=",", fmt="%.6f")
+            event_paths.extend([npy_path.name, csv_path.name])
+            saved_paths.extend([npy_path.name, csv_path.name])
+        stat["similarity_matrix_files"] = event_paths
+    return saved_paths
+
+
 def write_rows(path: str | Path, rows: list[dict]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -363,12 +421,13 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
         args.sequences,
         args.all_scenes,
         args.seven_scenes_split,
+        args.bonn_rgb_dir,
     )
     for seq in tqdm(sequences, desc=f"VGGT-Omega {dataset} video depth eval"):
-        images = limit_frames(sequence_images(dataset, dataset_root, seq), args.max_frames_per_seq)
-        gt_paths = sequence_depths(dataset, dataset_root, seq)
+        images = limit_frames(sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir), args.max_frames_per_seq)
+        gt_paths = sequence_depths(dataset, dataset_root, seq, args.bonn_depth_dir, args.bonn_rgb_dir)
         seq_dir = output_root / seq
-        pred_paths = sorted(seq_dir.glob("frame_*.npy"))
+        pred_paths = sorted(seq_dir.glob("frame_[0-9][0-9][0-9][0-9].npy"))
         gt_paths = limit_frames(gt_paths, args.max_frames_per_seq)
         if not (len(pred_paths) == len(gt_paths) == len(images)):
             raise ValueError(
@@ -399,6 +458,7 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
         row["token_merging_method"] = timing.get("token_merging_method")
         row["token_merging_start"] = timing.get("token_merging_start")
         row["token_merging_ratio"] = timing.get("token_merging_ratio")
+        row["token_merging_layer_ratios"] = timing.get("token_merging_layer_ratios")
         row["token_merging_tstm_threshold"] = timing.get("token_merging_tstm_threshold")
         row["token_merging_tstm_neighbor_size"] = timing.get("token_merging_tstm_neighbor_size")
         row["token_merging_flashvid_alpha"] = timing.get("token_merging_flashvid_alpha")
@@ -420,6 +480,28 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
             "token_merging_frame_multi_span_threshold"
         )
         row["token_merging_frame_group_strategy"] = timing.get("token_merging_frame_group_strategy")
+        row["token_merging_frame_protect_period"] = timing.get("token_merging_frame_protect_period")
+        row["token_merging_frame_protect_prefix"] = timing.get("token_merging_frame_protect_prefix")
+        row["omega_accelerator"] = timing.get("omega_accelerator")
+        row["sparse_vggt_sparsity_mean"] = timing.get("sparse_vggt_sparsity_mean")
+        row["sparse_vggt_sparse_ratio"] = timing.get("sparse_vggt_sparse_ratio")
+        row["sparse_vggt_cdf_threshold"] = timing.get("sparse_vggt_cdf_threshold")
+        row["sparse_vggt_pool_mode"] = timing.get("sparse_vggt_pool_mode")
+        row["da_vggt_num_chunks_mean"] = timing.get("da_vggt_num_chunks_mean")
+        row["da_vggt_chunk_size"] = timing.get("da_vggt_chunk_size")
+        row["da_vggt_sampling_method"] = timing.get("da_vggt_sampling_method")
+        row["frame_merge_active_frames_mean"] = timing.get("frame_merge_active_frames_mean")
+        row["frame_merge_retention_ratio_mean"] = timing.get("frame_merge_retention_ratio_mean")
+        row["frame_merge_merge_ratio_mean"] = timing.get("frame_merge_merge_ratio_mean")
+        row["token_merging_active_over_frame_merged_token_ratio_mean"] = timing.get(
+            "token_merging_active_over_frame_merged_token_ratio_mean"
+        )
+        row["token_merging_active_over_frame_original_token_ratio_mean"] = timing.get(
+            "token_merging_active_over_frame_original_token_ratio_mean"
+        )
+        row["token_merging_full_attention_token_ratio_mean"] = timing.get(
+            "token_merging_full_attention_token_ratio_mean"
+        )
         sequence_rows.append(row)
 
     weights = np.asarray([row["valid_pixels"] for row in sequence_rows], dtype=np.float64)
@@ -446,6 +528,7 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
             "token_merging_method",
             "token_merging_start",
             "token_merging_ratio",
+            "token_merging_layer_ratios",
             "token_merging_tstm_threshold",
             "token_merging_tstm_neighbor_size",
             "token_merging_flashvid_alpha",
@@ -461,7 +544,13 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
             "token_merging_frame_multi_pair_threshold",
             "token_merging_frame_multi_span_threshold",
             "token_merging_frame_group_strategy",
+            "token_merging_frame_protect_period",
+            "token_merging_frame_protect_prefix",
+            "omega_accelerator",
+            "sparse_vggt_pool_mode",
+            "da_vggt_sampling_method",
         }
+        and all(isinstance(row.get(key), (int, float)) and row.get(key) is not None for row in sequence_rows)
     }
     total_frames = int(sum(row["frames"] for row in sequence_rows))
     total_time = float(sum(row["time"] for row in sequence_rows))
@@ -489,6 +578,7 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
             "token_merging_method": args.token_merging_method,
             "token_merging_start": args.token_merging_start,
             "token_merging_ratio": args.token_merging_ratio,
+            "token_merging_layer_ratios": args.token_merging_layer_ratios,
             "token_merging_tstm_threshold": args.token_merging_tstm_threshold,
             "token_merging_tstm_neighbor_size": args.token_merging_tstm_neighbor_size,
             "token_merging_flashvid_alpha": args.token_merging_flashvid_alpha,
@@ -504,6 +594,17 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
             "token_merging_frame_multi_pair_threshold": args.token_merging_frame_multi_pair_threshold,
             "token_merging_frame_multi_span_threshold": args.token_merging_frame_multi_span_threshold,
             "token_merging_frame_group_strategy": args.token_merging_frame_group_strategy,
+            "token_merging_frame_protect_period": args.token_merging_frame_protect_period,
+            "token_merging_frame_protect_prefix": args.token_merging_frame_protect_prefix,
+            "omega_accelerator": args.omega_accelerator,
+            "sparse_vggt_sparse_ratio": args.sparse_vggt_sparse_ratio,
+            "sparse_vggt_cdf_threshold": args.sparse_vggt_cdf_threshold,
+            "sparse_vggt_pool_mode": args.sparse_vggt_pool_mode,
+            "da_vggt_max_frames": args.da_vggt_max_frames,
+            "da_vggt_sampling_method": args.da_vggt_sampling_method,
+            "da_vggt_n_anchors": args.da_vggt_n_anchors,
+            "da_vggt_dino_batch_size": args.da_vggt_dino_batch_size,
+            "da_vggt_lambda_div": args.da_vggt_lambda_div,
             "eval_align": args.eval_align,
             "valid_pixels": int(weights.sum()),
         }
@@ -513,14 +614,29 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
     with (output_root / f"_summary_{args.eval_align}.json").open("w") as handle:
         json.dump(summary, handle, indent=2)
     if __package__:
-        from .pose_auc import summarize_pose_auc, write_json
+        from .pose_auc import evaluate_pose_auc, summarize_pose_auc, write_json
     else:
-        from pose_auc import summarize_pose_auc, write_json
+        from pose_auc import evaluate_pose_auc, summarize_pose_auc, write_json
 
     pose_rows = []
     for seq in sequences:
         pose_path = output_root / seq / "_pose_auc.json"
-        if pose_path.is_file():
+        pred_pose_path = output_root / seq / "pred_poses.npy"
+        images = limit_frames(sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir), args.max_frames_per_seq)
+        gt_poses = sequence_poses(dataset, dataset_root, seq, len(images), images)
+        if pred_pose_path.is_file() and gt_poses is not None:
+            pred_poses = np.load(pred_pose_path)
+            pose_row = evaluate_pose_auc(
+                pred_poses,
+                gt_poses,
+                num_frames=args.pose_eval_frames,
+                seed=args.pose_eval_seed,
+                sequence=seq,
+            )
+            write_json(pose_path, pose_row)
+            pose_row["sequence"] = seq
+            pose_rows.append(pose_row)
+        elif pose_path.is_file():
             with pose_path.open() as handle:
                 pose_row = json.load(handle)
             pose_row["sequence"] = seq
@@ -540,6 +656,18 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
                 "seconds_per_frame": summary.get("seconds_per_frame"),
                 "peak_memory_allocated_gb": summary.get("peak_memory_allocated_gb"),
                 "peak_memory_reserved_gb": summary.get("peak_memory_reserved_gb"),
+                "frame_merge_active_frames_mean": summary.get("frame_merge_active_frames_mean"),
+                "frame_merge_retention_ratio_mean": summary.get("frame_merge_retention_ratio_mean"),
+                "frame_merge_merge_ratio_mean": summary.get("frame_merge_merge_ratio_mean"),
+                "token_merging_active_over_frame_merged_token_ratio_mean": summary.get(
+                    "token_merging_active_over_frame_merged_token_ratio_mean"
+                ),
+                "token_merging_active_over_frame_original_token_ratio_mean": summary.get(
+                    "token_merging_active_over_frame_original_token_ratio_mean"
+                ),
+                "token_merging_full_attention_token_ratio_mean": summary.get(
+                    "token_merging_full_attention_token_ratio_mean"
+                ),
             },
         },
     )
@@ -565,6 +693,7 @@ def main() -> None:
         enable_token_merging=args.enable_token_merging,
         token_merging_start=args.token_merging_start,
         token_merging_ratio=args.token_merging_ratio,
+        token_merging_layer_ratios=args.token_merging_layer_ratios,
         token_merging_method=args.token_merging_method,
         token_merging_tstm_threshold=args.token_merging_tstm_threshold,
         token_merging_tstm_neighbor_size=args.token_merging_tstm_neighbor_size,
@@ -581,6 +710,17 @@ def main() -> None:
         token_merging_frame_multi_pair_threshold=args.token_merging_frame_multi_pair_threshold,
         token_merging_frame_multi_span_threshold=args.token_merging_frame_multi_span_threshold,
         token_merging_frame_group_strategy=args.token_merging_frame_group_strategy,
+        token_merging_frame_protect_period=args.token_merging_frame_protect_period,
+        token_merging_frame_protect_prefix=args.token_merging_frame_protect_prefix,
+        omega_accelerator=args.omega_accelerator,
+        sparse_vggt_sparse_ratio=args.sparse_vggt_sparse_ratio,
+        sparse_vggt_cdf_threshold=args.sparse_vggt_cdf_threshold,
+        sparse_vggt_pool_mode=args.sparse_vggt_pool_mode,
+        da_vggt_max_frames=args.da_vggt_max_frames,
+        da_vggt_sampling_method=args.da_vggt_sampling_method,
+        da_vggt_n_anchors=args.da_vggt_n_anchors,
+        da_vggt_dino_batch_size=args.da_vggt_dino_batch_size,
+        da_vggt_lambda_div=args.da_vggt_lambda_div,
     )
     for dataset in datasets:
         dataset_root = args.dataset_root or DEFAULT_DATASET_ROOTS[dataset]
@@ -590,14 +730,19 @@ def main() -> None:
             args.sequences,
             args.all_scenes,
             args.seven_scenes_split,
+            args.bonn_rgb_dir,
         )
         output_root = Path(args.output_dir) / dataset
 
         for seq in tqdm(sequences, desc=f"VGGT-Omega {dataset} video depth"):
-            images = limit_frames(sequence_images(dataset, dataset_root, seq), args.max_frames_per_seq)
+            images = limit_frames(sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir), args.max_frames_per_seq)
             output_dir = output_root / seq
             time_path = output_dir / "_time.json"
-            if not args.overwrite and time_path.is_file() and len(list(output_dir.glob("frame_*.npy"))) == len(images):
+            if (
+                not args.overwrite
+                and time_path.is_file()
+                and len(list(output_dir.glob("frame_[0-9][0-9][0-9][0-9].npy"))) == len(images)
+            ):
                 continue
             if device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -611,6 +756,7 @@ def main() -> None:
                 input_mode=args.input_mode,
                 use_amp=not args.no_amp,
             )
+            similarity_matrix_files = save_frame_similarity_matrices(output_dir, speed_metrics)
             assert depths is not None
             for frame_idx, depth in enumerate(depths.numpy()):
                 np.save(output_dir / f"frame_{frame_idx:04d}.npy", depth)
@@ -626,7 +772,13 @@ def main() -> None:
                     else:
                         from pose_auc import evaluate_pose_auc, write_json
 
-                    pose_metrics = evaluate_pose_auc(pred_poses, gt_poses)
+                    pose_metrics = evaluate_pose_auc(
+                        pred_poses,
+                        gt_poses,
+                        num_frames=args.pose_eval_frames,
+                        seed=args.pose_eval_seed,
+                        sequence=seq,
+                    )
                     write_json(output_dir / "_pose_auc.json", pose_metrics)
             with time_path.open("w") as handle:
                 json.dump(
@@ -636,6 +788,12 @@ def main() -> None:
                         "window_size": args.window_size,
                         "input_mode": args.input_mode,
                         "image_resolution": args.image_resolution,
+                        "bonn_rgb_dir": args.bonn_rgb_dir,
+                        "bonn_depth_dir": args.bonn_depth_dir,
+                        "pose_eval_frames": args.pose_eval_frames,
+                        "pose_eval_seed": args.pose_eval_seed,
+            "bonn_rgb_dir": args.bonn_rgb_dir,
+            "bonn_depth_dir": args.bonn_depth_dir,
                         "inter_frame_attention": args.inter_frame_attention,
                         "register_patch_sample_tokens": args.register_patch_sample_tokens,
                         "register_patch_sample_ratio": args.register_patch_sample_ratio,
@@ -646,6 +804,7 @@ def main() -> None:
                         "token_merging_method": args.token_merging_method,
                         "token_merging_start": args.token_merging_start,
                         "token_merging_ratio": args.token_merging_ratio,
+                        "token_merging_layer_ratios": args.token_merging_layer_ratios,
                         "token_merging_tstm_threshold": args.token_merging_tstm_threshold,
                         "token_merging_tstm_neighbor_size": args.token_merging_tstm_neighbor_size,
                         "token_merging_flashvid_alpha": args.token_merging_flashvid_alpha,
@@ -661,6 +820,18 @@ def main() -> None:
                         "token_merging_frame_multi_pair_threshold": args.token_merging_frame_multi_pair_threshold,
                         "token_merging_frame_multi_span_threshold": args.token_merging_frame_multi_span_threshold,
                         "token_merging_frame_group_strategy": args.token_merging_frame_group_strategy,
+                        "token_merging_frame_protect_period": args.token_merging_frame_protect_period,
+                        "token_merging_frame_protect_prefix": args.token_merging_frame_protect_prefix,
+                        "omega_accelerator": args.omega_accelerator,
+                        "sparse_vggt_sparse_ratio": args.sparse_vggt_sparse_ratio,
+                        "sparse_vggt_cdf_threshold": args.sparse_vggt_cdf_threshold,
+                        "sparse_vggt_pool_mode": args.sparse_vggt_pool_mode,
+                        "da_vggt_max_frames": args.da_vggt_max_frames,
+                        "da_vggt_sampling_method": args.da_vggt_sampling_method,
+                        "da_vggt_n_anchors": args.da_vggt_n_anchors,
+                        "da_vggt_dino_batch_size": args.da_vggt_dino_batch_size,
+                        "da_vggt_lambda_div": args.da_vggt_lambda_div,
+                        "frame_similarity_matrix_files": similarity_matrix_files,
                         "elapsed": elapsed,
                     },
                     handle,

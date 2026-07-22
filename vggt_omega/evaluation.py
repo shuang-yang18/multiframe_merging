@@ -96,8 +96,6 @@ def read_sintel_depth(filename: str | Path) -> np.ndarray:
 
 def read_bonn_depth(filename: str | Path) -> np.ndarray:
     depth_png = np.asarray(Image.open(filename))
-    if np.max(depth_png) <= 255:
-        raise ValueError(f"Expected 16-bit Bonn depth image: {filename}")
     depth = depth_png.astype(np.float32) / 5000.0
     depth[depth_png == 0] = -1.0
     return depth
@@ -169,6 +167,7 @@ def load_model(
     enable_token_merging: bool = False,
     token_merging_start: int = 0,
     token_merging_ratio: float = 0.9,
+    token_merging_layer_ratios: str = "",
     token_merging_method: str = "spatial",
     token_merging_tstm_threshold: float = 0.8,
     token_merging_tstm_neighbor_size: int = 3,
@@ -185,6 +184,17 @@ def load_model(
     token_merging_frame_multi_pair_threshold: float = 0.95,
     token_merging_frame_multi_span_threshold: float = 0.93,
     token_merging_frame_group_strategy: str = "local",
+    token_merging_frame_protect_period: int = 0,
+    token_merging_frame_protect_prefix: int = 0,
+    omega_accelerator: str = "none",
+    sparse_vggt_sparse_ratio: float | None = 0.5,
+    sparse_vggt_cdf_threshold: float | None = None,
+    sparse_vggt_pool_mode: str = "avg",
+    da_vggt_max_frames: int = 0,
+    da_vggt_sampling_method: str = "fl_maxmin",
+    da_vggt_n_anchors: int = 1,
+    da_vggt_dino_batch_size: int = 256,
+    da_vggt_lambda_div: float = 0.0,
 ) -> VGGTOmega:
     checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.is_file():
@@ -205,6 +215,7 @@ def load_model(
             enable_token_merging=enable_token_merging,
             token_merging_start=token_merging_start,
             token_merging_ratio=token_merging_ratio,
+            token_merging_layer_ratios=token_merging_layer_ratios,
             token_merging_method=token_merging_method,
             token_merging_tstm_threshold=token_merging_tstm_threshold,
             token_merging_tstm_neighbor_size=token_merging_tstm_neighbor_size,
@@ -221,6 +232,17 @@ def load_model(
             token_merging_frame_multi_pair_threshold=token_merging_frame_multi_pair_threshold,
             token_merging_frame_multi_span_threshold=token_merging_frame_multi_span_threshold,
             token_merging_frame_group_strategy=token_merging_frame_group_strategy,
+            token_merging_frame_protect_period=token_merging_frame_protect_period,
+            token_merging_frame_protect_prefix=token_merging_frame_protect_prefix,
+            omega_accelerator=omega_accelerator,
+            sparse_vggt_sparse_ratio=sparse_vggt_sparse_ratio,
+            sparse_vggt_cdf_threshold=sparse_vggt_cdf_threshold,
+            sparse_vggt_pool_mode=sparse_vggt_pool_mode,
+            da_vggt_max_frames=da_vggt_max_frames,
+            da_vggt_sampling_method=da_vggt_sampling_method,
+            da_vggt_n_anchors=da_vggt_n_anchors,
+            da_vggt_dino_batch_size=da_vggt_dino_batch_size,
+            da_vggt_lambda_div=da_vggt_lambda_div,
         ).eval()
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if isinstance(state, dict) and "state_dict" in state:
@@ -290,6 +312,8 @@ def infer_sequence(
     all_confidences = []
     frame_merge_stats = []
     token_merging_stats = []
+    sparse_vggt_stats = []
+    da_vggt_stats = []
     output_resolution = None
     elapsed = 0.0
     if device.type == "cuda":
@@ -324,6 +348,9 @@ def infer_sequence(
                 predictions = model(images, use_amp=use_amp)
         frame_merge_stats.extend(predictions.get("frame_merge_stats", []))
         token_merging_stats.extend(predictions.get("token_merging_stats", []))
+        sparse_vggt_stats.extend(predictions.get("sparse_vggt_stats", []))
+        if "da_vggt_stats" in predictions:
+            da_vggt_stats.append(predictions["da_vggt_stats"])
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         elapsed += time.perf_counter() - start
@@ -355,6 +382,7 @@ def infer_sequence(
         reserved_after_bytes = 0
     frames = len(image_paths)
     speed_metrics = {
+        "omega_accelerator": getattr(model, "omega_accelerator", "none"),
         "time": elapsed,
         "frames": frames,
         "fps": frames / elapsed if elapsed > 0 else None,
@@ -417,6 +445,29 @@ def infer_sequence(
                 )
                 / len(active_over_frame_original_ratios),
                 "token_merging_stats": token_merging_stats,
+            }
+        )
+    if sparse_vggt_stats:
+        sparsities = [float(stat["sparsity"]) for stat in sparse_vggt_stats]
+        speed_metrics.update(
+            {
+                "sparse_vggt_events": len(sparse_vggt_stats),
+                "sparse_vggt_sparsity_mean": sum(sparsities) / len(sparsities),
+                "sparse_vggt_sparse_ratio": sparse_vggt_stats[0].get("sparse_ratio"),
+                "sparse_vggt_cdf_threshold": sparse_vggt_stats[0].get("cdf_threshold"),
+                "sparse_vggt_pool_mode": sparse_vggt_stats[0].get("pool_mode"),
+                "sparse_vggt_stats": sparse_vggt_stats,
+            }
+        )
+    if da_vggt_stats:
+        speed_metrics.update(
+            {
+                "da_vggt_events": len(da_vggt_stats),
+                "da_vggt_num_chunks_mean": sum(float(stat["da_vggt_num_chunks"]) for stat in da_vggt_stats)
+                / len(da_vggt_stats),
+                "da_vggt_chunk_size": da_vggt_stats[0].get("da_vggt_chunk_size"),
+                "da_vggt_sampling_method": da_vggt_stats[0].get("da_vggt_sampling_method"),
+                "da_vggt_stats": da_vggt_stats,
             }
         )
     return elapsed, depths, poses, confidences, output_resolution, speed_metrics

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import zlib
 
 import numpy as np
 
@@ -32,13 +33,16 @@ def _rotation_angle_deg(rotation: np.ndarray) -> float:
     return float(np.degrees(np.arccos(value)))
 
 
-def _translation_angle_deg(pred: np.ndarray, gt: np.ndarray, eps: float = 1e-8) -> float | None:
+def _translation_angle_deg(pred: np.ndarray, gt: np.ndarray, eps: float = 1e-8, ambiguity: bool = True) -> float | None:
     pred_norm = np.linalg.norm(pred)
     gt_norm = np.linalg.norm(gt)
     if pred_norm < eps or gt_norm < eps:
         return None
     value = np.clip(np.dot(pred, gt) / (pred_norm * gt_norm), -1.0, 1.0)
-    return float(np.degrees(np.arccos(value)))
+    angle = float(np.degrees(np.arccos(value)))
+    if ambiguity:
+        angle = min(angle, abs(180.0 - angle))
+    return angle
 
 
 def _auc(errors: list[float], threshold: float) -> float:
@@ -48,12 +52,29 @@ def _auc(errors: list[float], threshold: float) -> float:
     return float(np.mean(np.maximum(1.0 - values / threshold, 0.0)) * 100.0)
 
 
-def evaluate_pose_auc(pred: np.ndarray, gt: np.ndarray) -> dict:
+def _sample_indices(count: int, num_frames: int = 10, seed: int = 0, sequence: str = "") -> np.ndarray:
+    if num_frames <= 0 or count <= num_frames:
+        return np.arange(count, dtype=np.int64)
+    seq_seed = int(seed) ^ zlib.crc32(sequence.encode("utf-8"))
+    rng = np.random.default_rng(seq_seed)
+    return np.sort(rng.choice(count, size=num_frames, replace=False))
+
+
+def evaluate_pose_auc(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    *,
+    num_frames: int = 10,
+    seed: int = 0,
+    sequence: str = "",
+) -> dict:
     count = min(len(pred), len(gt))
     if count < 2:
         raise ValueError("Pose AUC needs at least two poses.")
-    pred = np.asarray(pred[:count], dtype=np.float64)
-    gt = np.asarray(gt[:count], dtype=np.float64)
+    sampled_indices = _sample_indices(count, num_frames=num_frames, seed=seed, sequence=sequence)
+    pred = np.asarray(pred[:count], dtype=np.float64)[sampled_indices]
+    gt = np.asarray(gt[:count], dtype=np.float64)[sampled_indices]
+    count = len(sampled_indices)
 
     scale, rotation, translation = _umeyama_alignment(pred[:, :3, 3], gt[:, :3, 3])
     aligned = pred.copy()
@@ -84,6 +105,10 @@ def evaluate_pose_auc(pred: np.ndarray, gt: np.ndarray) -> dict:
         "AUC@30": _auc(pose_errors, 30.0),
         "frames": int(count),
         "pairs": int(len(pose_errors)),
+        "sampled_frame_indices": [int(value) for value in sampled_indices.tolist()],
+        "pose_eval_frames": int(num_frames),
+        "pose_eval_seed": int(seed),
+        "translation_angle_ambiguity": True,
         "mean_pose_error_deg": float(np.mean(pose_errors)) if pose_errors else 0.0,
         "median_pose_error_deg": float(np.median(pose_errors)) if pose_errors else 0.0,
         "mean_rotation_error_deg": float(np.mean(rotation_errors)) if rotation_errors else 0.0,
@@ -103,7 +128,7 @@ def summarize_pose_auc(rows: list[dict]) -> dict:
         pose_errors.extend(row.get("pose_errors_deg", []))
         rotation_errors.extend(row.get("rotation_errors_deg", []))
         translation_errors.extend(row.get("translation_errors_deg", []))
-    return {
+    summary = {
         "AUC@3": _auc(pose_errors, 3.0),
         "AUC@30": _auc(pose_errors, 30.0),
         "sequences": len(rows),
@@ -113,6 +138,11 @@ def summarize_pose_auc(rows: list[dict]) -> dict:
         "mean_rotation_error_deg": float(np.mean(rotation_errors)) if rotation_errors else 0.0,
         "mean_translation_error_deg": float(np.mean(translation_errors)) if translation_errors else 0.0,
     }
+    if rows:
+        summary["pose_eval_frames"] = rows[0].get("pose_eval_frames")
+        summary["pose_eval_seed"] = rows[0].get("pose_eval_seed")
+        summary["translation_angle_ambiguity"] = rows[0].get("translation_angle_ambiguity")
+    return summary
 
 
 def write_json(path: str | Path, payload: dict) -> None:

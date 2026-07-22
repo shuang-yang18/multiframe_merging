@@ -62,6 +62,11 @@ SEVEN_SCENES_ROOT=datasets/7scenes/test
 
 All reported long-sequence experiments use `MAX_FRAMES=300`.
 
+Pose AUC follows the paper-style default protocol: each sequence samples 10
+frames with a deterministic seed (`--pose-eval-frames 10 --pose-eval-seed 0`).
+Set `--pose-eval-frames 0` only when you intentionally want full-frame AUC for
+analysis.
+
 ## Main Method
 
 Run multi-frame merging plus FastVGGT-style spatial token merging:

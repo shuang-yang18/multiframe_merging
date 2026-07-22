@@ -87,6 +87,8 @@ class SelfAttention(nn.Module):
         self.fastvggt_protected_token_indices = None
         self.fastvggt_dynamic_frame_mask = None
         self.last_fastvggt_stats = None
+        self.sparse_vggt_config = None
+        self.last_sparse_vggt_stats = None
         self.capture_cls_attention = False
         self.last_cls_attention = None
 
@@ -149,6 +151,22 @@ class SelfAttention(nn.Module):
             self.last_cls_attention = cls_attention.to(q.dtype)
         unmerge = None
         self.last_fastvggt_stats = None
+        self.last_sparse_vggt_stats = None
+        if self.sparse_vggt_config is not None:
+            if self.fastvggt_merge_ratio is not None:
+                raise RuntimeError("Sparse-VGGT attention cannot be combined with FastVGGT token merging.")
+            x, sparsity = _sparse_vggt_attention_from_qkv(q, k, v, self.sparse_vggt_config)
+            self.last_sparse_vggt_stats = {
+                "original_tokens": int(N),
+                "active_tokens": int(N),
+                "sparsity": float(sparsity),
+                "sparse_ratio": self.sparse_vggt_config.get("sparse_ratio"),
+                "cdf_threshold": self.sparse_vggt_config.get("cdf_threshold"),
+                "pool_mode": self.sparse_vggt_config.get("pool_mode"),
+                "num_frames": int(self.sparse_vggt_config["num_frames"]),
+                "special_token_count": int(self.sparse_vggt_config["special_token_count"]),
+            }
+            return x
         if self.fastvggt_merge_ratio is not None:
             original_token_count = N
             merge, unmerge = _fastvggt_token_merge_bipartite2d(
@@ -181,6 +199,51 @@ class SelfAttention(nn.Module):
         if unmerge is not None:
             x = unmerge(x)
         return x
+
+
+def _sparse_vggt_attention_from_qkv(q: Tensor, k: Tensor, v: Tensor, config: dict) -> tuple[Tensor, float]:
+    from vggt_omega.models.sparse_vggt_attention import sparse_vggt_attention
+
+    batch_size, num_heads, total_tokens, head_dim = q.shape
+    num_frames = int(config["num_frames"])
+    special_token_count = int(config["special_token_count"])
+    patch_grid_size = config["patch_grid_size"]
+    patch_tokens_per_frame = int(patch_grid_size[0] * patch_grid_size[1])
+    tokens_per_frame = special_token_count + patch_tokens_per_frame
+    if total_tokens != num_frames * tokens_per_frame:
+        raise ValueError(
+            "Sparse-VGGT token layout mismatch: "
+            f"tokens={total_tokens}, frames={num_frames}, tokens_per_frame={tokens_per_frame}"
+        )
+
+    q_view = q.view(batch_size, num_heads, num_frames, tokens_per_frame, head_dim)
+    k_view = k.view(batch_size, num_heads, num_frames, tokens_per_frame, head_dim)
+    v_view = v.view(batch_size, num_heads, num_frames, tokens_per_frame, head_dim)
+
+    q_special = q_view[:, :, :, :special_token_count].reshape(batch_size, num_heads, num_frames * special_token_count, head_dim)
+    k_special = k_view[:, :, :, :special_token_count].reshape(batch_size, num_heads, num_frames * special_token_count, head_dim)
+    v_special = v_view[:, :, :, :special_token_count].reshape(batch_size, num_heads, num_frames * special_token_count, head_dim)
+    q_patch = q_view[:, :, :, special_token_count:].reshape(batch_size, num_heads, num_frames * patch_tokens_per_frame, head_dim)
+    k_patch = k_view[:, :, :, special_token_count:].reshape(batch_size, num_heads, num_frames * patch_tokens_per_frame, head_dim)
+    v_patch = v_view[:, :, :, special_token_count:].reshape(batch_size, num_heads, num_frames * patch_tokens_per_frame, head_dim)
+
+    x_special = torch.nn.functional.scaled_dot_product_attention(q_special, k, v)
+    key = torch.cat([k_patch, k_special], dim=-2)
+    value = torch.cat([v_patch, v_special], dim=-2)
+    x_patch, sparsity = sparse_vggt_attention(
+        q_patch,
+        key,
+        value,
+        sparse_ratio=config.get("sparse_ratio"),
+        cdf_threshold=config.get("cdf_threshold"),
+        pool_mode=config.get("pool_mode", "avg"),
+    )
+
+    x_special = x_special.view(batch_size, num_heads, num_frames, special_token_count, head_dim)
+    x_patch = x_patch.view(batch_size, num_heads, num_frames, patch_tokens_per_frame, head_dim)
+    x = torch.cat([x_special, x_patch], dim=-2)
+    x = x.reshape(batch_size, num_heads, total_tokens, head_dim).transpose(1, 2)
+    return x.reshape(batch_size, total_tokens, num_heads * head_dim), sparsity
 
 
 def _fastvggt_token_merge_bipartite2d(

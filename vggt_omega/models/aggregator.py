@@ -34,6 +34,7 @@ class Aggregator(nn.Module):
         enable_token_merging: bool = False,
         token_merging_start: int = 0,
         token_merging_ratio: float = 0.9,
+        token_merging_layer_ratios: str = "",
         token_merging_method: str = "spatial",
         token_merging_tstm_threshold: float = 0.8,
         token_merging_tstm_neighbor_size: int = 3,
@@ -50,6 +51,18 @@ class Aggregator(nn.Module):
         token_merging_frame_multi_pair_threshold: float = 0.95,
         token_merging_frame_multi_span_threshold: float = 0.93,
         token_merging_frame_group_strategy: str = "local",
+        token_merging_frame_protect_period: int = 0,
+        token_merging_frame_protect_prefix: int = 0,
+        enable_sparse_vggt: bool = False,
+        sparse_vggt_sparse_ratio: float | None = 0.5,
+        sparse_vggt_cdf_threshold: float | None = None,
+        sparse_vggt_pool_mode: str = "avg",
+        enable_da_vggt: bool = False,
+        da_vggt_max_frames: int = 0,
+        da_vggt_sampling_method: str = "fl_maxmin",
+        da_vggt_n_anchors: int = 1,
+        da_vggt_dino_batch_size: int = 256,
+        da_vggt_lambda_div: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -106,6 +119,8 @@ class Aggregator(nn.Module):
         self.enable_token_merging = enable_token_merging
         self.token_merging_start = token_merging_start
         self.token_merging_ratio = token_merging_ratio
+        self.token_merging_layer_ratios = token_merging_layer_ratios
+        self._token_merging_layer_ratio_map = _parse_layer_ratio_schedule(token_merging_layer_ratios, depth)
         self.token_merging_method = token_merging_method
         self.token_merging_tstm_threshold = token_merging_tstm_threshold
         if token_merging_tstm_neighbor_size < 0 or (
@@ -133,14 +148,42 @@ class Aggregator(nn.Module):
         self.token_merging_frame_multi_max_group_size = token_merging_frame_multi_max_group_size
         self.token_merging_frame_multi_pair_threshold = token_merging_frame_multi_pair_threshold
         self.token_merging_frame_multi_span_threshold = token_merging_frame_multi_span_threshold
-        if token_merging_frame_group_strategy not in {"local", "segment_middle", "global_cluster"}:
+        if token_merging_frame_protect_period < 0 or token_merging_frame_protect_prefix < 0:
+            raise ValueError("token_merging_frame_protect_period/prefix must be non-negative")
+        self.token_merging_frame_protect_period = token_merging_frame_protect_period
+        self.token_merging_frame_protect_prefix = token_merging_frame_protect_prefix
+        if token_merging_frame_group_strategy not in {
+            "local",
+            "segment_middle",
+            "global_cluster",
+            "global_top_pairs",
+        }:
             raise ValueError(
-                "token_merging_frame_group_strategy must be 'local', 'segment_middle', or 'global_cluster'"
+                "token_merging_frame_group_strategy must be 'local', 'segment_middle', "
+                "'global_cluster', or 'global_top_pairs'"
             )
         self.token_merging_frame_group_strategy = token_merging_frame_group_strategy
         self.token_merging_protected_fraction = 0.5
         self.last_frame_merge_stats: list[dict[str, float | int | str]] = []
         self.last_token_merging_stats: list[dict[str, float | int | str]] = []
+        self.enable_sparse_vggt = enable_sparse_vggt
+        self.sparse_vggt_sparse_ratio = sparse_vggt_sparse_ratio
+        self.sparse_vggt_cdf_threshold = sparse_vggt_cdf_threshold
+        self.sparse_vggt_pool_mode = sparse_vggt_pool_mode
+        self.last_sparse_vggt_stats: list[dict[str, float | int | str | None]] = []
+        if enable_sparse_vggt:
+            from vggt_omega.models.sparse_vggt_attention import check_sparse_vggt_mode
+
+            check_sparse_vggt_mode(sparse_vggt_sparse_ratio, sparse_vggt_cdf_threshold)
+            if sparse_vggt_pool_mode not in {"avg", "max"}:
+                raise ValueError("sparse_vggt_pool_mode must be 'avg' or 'max'")
+
+        self.enable_da_vggt = enable_da_vggt
+        self.da_vggt_max_frames = da_vggt_max_frames
+        self.da_vggt_sampling_method = da_vggt_sampling_method
+        self.da_vggt_n_anchors = da_vggt_n_anchors
+        self.da_vggt_dino_batch_size = da_vggt_dino_batch_size
+        self.da_vggt_lambda_div = da_vggt_lambda_div
 
         self.inter_frame_attention_types = ["global"] * depth
         if register_attention_block_indices is None:
@@ -166,6 +209,7 @@ class Aggregator(nn.Module):
         batch_size, num_frames, num_channels, height, width = images.shape
         self.last_frame_merge_stats = []
         self.last_token_merging_stats = []
+        self.last_sparse_vggt_stats = []
         if num_channels != 3:
             raise ValueError(f"Expected 3 input channels, got {num_channels}")
 
@@ -306,6 +350,87 @@ class Aggregator(nn.Module):
 
         return outputs, self.patch_token_start
 
+    def forward_dino(
+        self,
+        images: torch.Tensor,
+        dino_batch_size: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if dino_batch_size is None:
+            dino_batch_size = self.da_vggt_dino_batch_size
+        batch_size, num_frames, num_channels, height, width = images.shape
+        if batch_size != 1:
+            raise ValueError("DA-VGGT chunked inference currently supports batch size 1.")
+        if num_channels != 3:
+            raise ValueError(f"Expected 3 input channels, got {num_channels}")
+
+        images = (images - self._resnet_mean) / self._resnet_std
+        images = images.view(batch_size * num_frames, num_channels, height, width)
+        all_patch_tokens = []
+        all_pooled_tokens = []
+        for start in range(0, batch_size * num_frames, dino_batch_size):
+            output = self.patch_embed(images[start : start + dino_batch_size])
+            if isinstance(output, dict):
+                patch_tokens = output["x_norm_patchtokens"]
+                pooled_tokens = output.get("x_norm_clstoken")
+                if pooled_tokens is None:
+                    pooled_tokens = patch_tokens.float().mean(dim=1)
+            else:
+                patch_tokens = output
+                pooled_tokens = patch_tokens.float().mean(dim=1)
+            all_patch_tokens.append(patch_tokens.cpu())
+            all_pooled_tokens.append(pooled_tokens.float().cpu())
+        return torch.cat(all_patch_tokens, dim=0), torch.cat(all_pooled_tokens, dim=0)
+
+    def forward_transformer(
+        self,
+        patch_tokens: torch.Tensor,
+        *,
+        batch_size: int,
+        num_frames: int,
+        height: int,
+        width: int,
+        device: torch.device,
+    ) -> tuple[list[torch.Tensor | None], int]:
+        camera_token = slice_expand_and_flatten(self.camera_token, batch_size, num_frames)
+        register_token = slice_expand_and_flatten(self.register_token, batch_size, num_frames)
+        tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
+        _, num_tokens, embed_dim = tokens.shape
+        patch_grid_size = (height // self.patch_size, width // self.patch_size)
+        with torch.no_grad():
+            rope_sin, rope_cos = self.rope_embed(H=patch_grid_size[0], W=patch_grid_size[1])
+            frame_rope = (
+                rope_sin.to(device=device, dtype=torch.float32),
+                rope_cos.to(device=device, dtype=torch.float32),
+            )
+
+        outputs = []
+        for block_idx in range(self.depth):
+            tokens, frame_tokens = self._run_frame_block(
+                tokens,
+                batch_size,
+                num_frames,
+                num_tokens,
+                embed_dim,
+                block_idx,
+                frame_rope,
+            )
+            tokens = self._run_inter_frame_attention_block(
+                tokens,
+                batch_size,
+                num_frames,
+                num_frames,
+                num_tokens,
+                embed_dim,
+                block_idx,
+                self.inter_frame_attention_types[block_idx],
+                patch_grid_size,
+            )
+            if block_idx in self.cached_layer_indices:
+                outputs.append(torch.cat([frame_tokens, tokens], dim=-1))
+            else:
+                outputs.append(None)
+        return outputs, self.patch_token_start
+
     def _run_frame_block(
         self,
         tokens: torch.Tensor,
@@ -387,7 +512,8 @@ class Aggregator(nn.Module):
             ):
                 tokens = tokens.view(batch_size, num_frames * num_tokens, embed_dim)
                 block = self.inter_frame_blocks[block_idx]
-                block.attn.fastvggt_merge_ratio = self.token_merging_ratio
+                layer_ratio = self._token_merging_ratio_for_block(block_idx)
+                block.attn.fastvggt_merge_ratio = layer_ratio
                 if self.token_merging_method == "protected_spatial":
                     block.attn.fastvggt_protection = "adts"
                 elif self.token_merging_method == "frame_persistent_decoupled_window":
@@ -416,6 +542,7 @@ class Aggregator(nn.Module):
                             {
                                 "block": int(block_idx),
                                 "mode": self.token_merging_method,
+                                "merge_ratio": float(layer_ratio),
                                 "frame_merged_tokens": frame_merged_tokens,
                                 "frame_original_tokens": frame_original_tokens,
                                 "active_over_frame_merged_token_ratio": float(
@@ -452,7 +579,26 @@ class Aggregator(nn.Module):
                     patch_grid_size,
                 )
             tokens = tokens.view(batch_size, num_frames * num_tokens, embed_dim)
-            tokens = self.inter_frame_blocks[block_idx](tokens, None)
+            if not self.enable_sparse_vggt:
+                tokens = self.inter_frame_blocks[block_idx](tokens, None)
+                return tokens.view(batch_size, num_frames, num_tokens, embed_dim)
+
+            block = self.inter_frame_blocks[block_idx]
+            block.attn.sparse_vggt_config = {
+                "sparse_ratio": self.sparse_vggt_sparse_ratio,
+                "cdf_threshold": self.sparse_vggt_cdf_threshold,
+                "pool_mode": self.sparse_vggt_pool_mode,
+                "num_frames": num_frames,
+                "patch_grid_size": patch_grid_size,
+                "special_token_count": self.patch_token_start,
+            }
+            try:
+                tokens = block(tokens, None)
+                sparse_stats = getattr(block.attn, "last_sparse_vggt_stats", None)
+                if sparse_stats:
+                    self.last_sparse_vggt_stats.append({"block": int(block_idx), **sparse_stats})
+            finally:
+                block.attn.sparse_vggt_config = None
             return tokens.view(batch_size, num_frames, num_tokens, embed_dim)
 
         if attention_type != "register":
@@ -560,6 +706,9 @@ class Aggregator(nn.Module):
             "'frame_persistent_decoupled', or 'frame_persistent_decoupled_window'"
         )
 
+    def _token_merging_ratio_for_block(self, block_idx: int) -> float:
+        return self._token_merging_layer_ratio_map.get(block_idx, self.token_merging_ratio)
+
     def _frame_merge(
         self,
         tokens: torch.Tensor,
@@ -581,6 +730,8 @@ class Aggregator(nn.Module):
                 self.token_merging_frame_multi_pair_threshold,
                 self.token_merging_frame_multi_span_threshold,
                 self.token_merging_frame_group_strategy,
+                self.token_merging_frame_protect_period,
+                self.token_merging_frame_protect_prefix,
             )
             merged_batches.append(merged_tokens)
             states.append(state)
@@ -612,35 +763,43 @@ class Aggregator(nn.Module):
             [int(active_idx) for active_idx in state.inverse.detach().cpu().tolist()]
             for state in states
         ]
+        similarity_matrices = [
+            state.similarity_matrix.detach().cpu().tolist()
+            for state in states
+            if state.similarity_matrix is not None
+        ]
         multi_group_sizes = [size for size in merge_group_sizes if size > 2]
-        self.last_frame_merge_stats.append(
-            {
-                "block": int(block_idx),
-                "mode": mode,
-                "original_frames": int(original_frames),
-                "active_frames_min": int(min(active_frames)),
-                "active_frames_mean": float(active_mean),
-                "active_frames_max": int(max(active_frames)),
-                "retention_ratio_mean": float(retention_ratio),
-                "merge_ratio_mean": float(1.0 - retention_ratio),
-                "segments_min": int(min(segment_counts)),
-                "segments_mean": float(sum(segment_counts) / len(segment_counts)),
-                "segments_max": int(max(segment_counts)),
-                "segments": segments,
-                "merge_groups": merge_groups,
-                "frame_to_active": frame_to_active,
-                "merge_groups_count": int(len(merge_group_sizes)),
-                "merge_group_size_mean": float(sum(merge_group_sizes) / len(merge_group_sizes))
-                if merge_group_sizes
-                else 0.0,
-                "merge_group_size_max": int(max(merge_group_sizes)) if merge_group_sizes else 0,
-                "multi_frame_groups_count": int(len(multi_group_sizes)),
-                "multi_frame_group_size_mean": float(sum(multi_group_sizes) / len(multi_group_sizes))
-                if multi_group_sizes
-                else 0.0,
+        stat = {
+            "block": int(block_idx),
+            "mode": mode,
+            "original_frames": int(original_frames),
+            "active_frames_min": int(min(active_frames)),
+            "active_frames_mean": float(active_mean),
+            "active_frames_max": int(max(active_frames)),
+            "retention_ratio_mean": float(retention_ratio),
+            "merge_ratio_mean": float(1.0 - retention_ratio),
+            "segments_min": int(min(segment_counts)),
+            "segments_mean": float(sum(segment_counts) / len(segment_counts)),
+            "segments_max": int(max(segment_counts)),
+            "segments": segments,
+            "merge_groups": merge_groups,
+            "frame_to_active": frame_to_active,
+            "merge_groups_count": int(len(merge_group_sizes)),
+            "merge_group_size_mean": float(sum(merge_group_sizes) / len(merge_group_sizes))
+            if merge_group_sizes
+            else 0.0,
+            "merge_group_size_max": int(max(merge_group_sizes)) if merge_group_sizes else 0,
+            "multi_frame_groups_count": int(len(multi_group_sizes)),
+            "multi_frame_group_size_mean": float(sum(multi_group_sizes) / len(multi_group_sizes))
+            if multi_group_sizes
+            else 0.0,
                 "frame_group_strategy": self.token_merging_frame_group_strategy,
+                "protect_period": int(self.token_merging_frame_protect_period),
+                "protect_prefix": int(self.token_merging_frame_protect_prefix),
             }
-        )
+        if similarity_matrices:
+            stat["similarity_matrices"] = similarity_matrices
+        self.last_frame_merge_stats.append(stat)
 
     def _flashvid_encoder_compress(
         self,
@@ -685,12 +844,14 @@ class _FrameMergeState:
         segments: list[tuple[int, int]],
         merge_group_sizes: list[int] | None = None,
         merge_groups: list[list[int]] | None = None,
+        similarity_matrix: torch.Tensor | None = None,
     ) -> None:
         self.inverse = inverse
         self.active_mask = active_mask
         self.segments = segments
         self.merge_group_sizes = merge_group_sizes or []
         self.merge_groups = merge_groups or []
+        self.similarity_matrix = similarity_matrix
         self.active_frames = int(inverse.max().item()) + 1 if inverse.numel() else 0
 
 
@@ -750,6 +911,8 @@ def _frame_merge_one(
     multi_pair_threshold: float,
     multi_span_threshold: float,
     group_strategy: str = "local",
+    protect_period: int = 0,
+    protect_prefix: int = 0,
 ) -> tuple[torch.Tensor, _FrameMergeState]:
     num_frames = tokens.shape[0]
     if num_frames <= 1:
@@ -765,6 +928,14 @@ def _frame_merge_one(
             pooled,
             sim_threshold=multi_pair_threshold,
             max_group_size=multi_max_group_size,
+            protect_period=protect_period,
+            protect_prefix=protect_prefix,
+        )
+    if group_strategy == "global_top_pairs":
+        return _frame_merge_global_top_pairs(
+            tokens,
+            pooled,
+            target_merge_ratio=multi_span_threshold,
         )
     segments = _streaming_frame_segments(pooled, alpha, segment_threshold, max_window)
 
@@ -867,10 +1038,11 @@ def _frame_merge_global_cluster(
     pooled: torch.Tensor,
     sim_threshold: float,
     max_group_size: int,
+    protect_period: int = 0,
+    protect_prefix: int = 0,
 ) -> tuple[torch.Tensor, _FrameMergeState]:
     num_frames = tokens.shape[0]
-    descriptors = F.normalize(pooled.float().mean(dim=1), dim=-1)
-    sim_matrix = descriptors @ descriptors.transpose(0, 1)
+    sim_matrix = _frame_similarity_matrix(pooled)
     pair_scores = []
     for left_idx in range(num_frames):
         for right_idx in range(left_idx + 1, num_frames):
@@ -882,13 +1054,20 @@ def _frame_merge_global_cluster(
     clusters: list[list[int]] = []
     frame_to_cluster: list[int | None] = [None] * num_frames
 
+    def is_protected(frame_idx: int) -> bool:
+        return protect_period > 0 and protect_prefix > 0 and frame_idx % protect_period < protect_prefix
+
     def can_join(cluster: list[int], frame_idx: int) -> bool:
         if len(cluster) >= max_group_size:
+            return False
+        if is_protected(frame_idx) or any(is_protected(idx) for idx in cluster):
             return False
         sims = sim_matrix[frame_idx, torch.tensor(cluster, device=tokens.device, dtype=torch.long)]
         return bool(torch.all(sims >= sim_threshold).item())
 
     for _, left_idx, right_idx in pair_scores:
+        if is_protected(left_idx) or is_protected(right_idx):
+            continue
         left_cluster = frame_to_cluster[left_idx]
         right_cluster = frame_to_cluster[right_idx]
         if left_cluster is None and right_cluster is None:
@@ -931,7 +1110,95 @@ def _frame_merge_global_cluster(
 
     merged_tokens = torch.stack(active_tokens, dim=0)
     segments = [(idx, idx) for idx in range(num_frames)]
-    return merged_tokens, _FrameMergeState(inverse, active_mask, segments, merge_group_sizes, merge_groups)
+    return merged_tokens, _FrameMergeState(
+        inverse,
+        active_mask,
+        segments,
+        merge_group_sizes,
+        merge_groups,
+        sim_matrix,
+    )
+
+
+def _frame_merge_global_top_pairs(
+    tokens: torch.Tensor,
+    pooled: torch.Tensor,
+    target_merge_ratio: float,
+) -> tuple[torch.Tensor, _FrameMergeState]:
+    num_frames = tokens.shape[0]
+    if target_merge_ratio > 1.0:
+        target_pairs = int(round(target_merge_ratio))
+    else:
+        target_pairs = int(round(num_frames * max(0.0, min(0.5, target_merge_ratio))))
+    target_pairs = min(target_pairs, num_frames // 2)
+    if target_pairs <= 0:
+        inverse = torch.arange(num_frames, device=tokens.device)
+        active_mask = torch.ones(num_frames, dtype=torch.bool, device=tokens.device)
+        return tokens, _FrameMergeState(inverse, active_mask, [(idx, idx) for idx in range(num_frames)], [])
+
+    sim_matrix = _frame_similarity_matrix(pooled)
+    pair_scores = []
+    for left_idx in range(num_frames):
+        for right_idx in range(left_idx + 1, num_frames):
+            pair_scores.append((float(sim_matrix[left_idx, right_idx].item()), left_idx, right_idx))
+    pair_scores.sort(reverse=True, key=lambda item: item[0])
+
+    used = [False] * num_frames
+    selected_pairs: list[list[int]] = []
+    for _, left_idx, right_idx in pair_scores:
+        if used[left_idx] or used[right_idx]:
+            continue
+        selected_pairs.append([left_idx, right_idx])
+        used[left_idx] = True
+        used[right_idx] = True
+        if len(selected_pairs) >= target_pairs:
+            break
+
+    pair_by_first = {pair[0]: pair for pair in selected_pairs}
+    inverse = torch.empty(num_frames, dtype=torch.long, device=tokens.device)
+    active_mask = torch.zeros(num_frames, dtype=torch.bool, device=tokens.device)
+    active_tokens = []
+    merge_group_sizes: list[int] = []
+    merge_groups: list[list[int]] = []
+    consumed = [False] * num_frames
+    for frame_idx in range(num_frames):
+        if consumed[frame_idx]:
+            continue
+        if frame_idx in pair_by_first:
+            pair = pair_by_first[frame_idx]
+            active_idx = len(active_tokens)
+            frame_indices = torch.tensor(pair, device=tokens.device, dtype=torch.long)
+            inverse[frame_indices] = active_idx
+            active_mask[pair[0]] = True
+            active_tokens.append(tokens[frame_indices].float().mean(dim=0).to(tokens.dtype))
+            merge_group_sizes.append(2)
+            merge_groups.append([int(idx) for idx in pair])
+            consumed[pair[0]] = True
+            consumed[pair[1]] = True
+        else:
+            active_idx = len(active_tokens)
+            inverse[frame_idx] = active_idx
+            active_mask[frame_idx] = True
+            active_tokens.append(tokens[frame_idx])
+            consumed[frame_idx] = True
+
+    merged_tokens = torch.stack(active_tokens, dim=0)
+    segments = [(idx, idx) for idx in range(num_frames)]
+    return merged_tokens, _FrameMergeState(
+        inverse,
+        active_mask,
+        segments,
+        merge_group_sizes,
+        merge_groups,
+        sim_matrix,
+    )
+
+
+def _frame_similarity_matrix(pooled: torch.Tensor) -> torch.Tensor:
+    device_type = pooled.device.type if pooled.device.type in {"cuda", "cpu"} else "cpu"
+    with torch.autocast(device_type=device_type, enabled=False):
+        descriptors = F.normalize(pooled.float().mean(dim=1), dim=-1)
+        return (descriptors @ descriptors.transpose(0, 1)).clamp_(-1.0, 1.0)
 
 
 def _pool_frame_similarity_tokens(
@@ -1447,6 +1714,34 @@ def _target_tokens(num_tokens: int, retention_ratio: float) -> int:
 
 def _retention_from_merge_ratio(merge_ratio: float) -> float:
     return max(1e-6, min(1.0, 1.0 - merge_ratio))
+
+
+def _parse_layer_ratio_schedule(schedule: str, depth: int) -> dict[int, float]:
+    if not schedule:
+        return {}
+    ratios: dict[int, float] = {}
+    for raw_part in schedule.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise ValueError(f"Invalid token merging layer ratio segment {part!r}; expected layers:ratio")
+        layer_spec, ratio_spec = part.split(":", 1)
+        ratio = float(ratio_spec)
+        if ratio < 0.0 or ratio >= 1.0:
+            raise ValueError("Layer-wise token merging ratios must be in [0, 1)")
+        layer_spec = layer_spec.strip()
+        if "-" in layer_spec:
+            start_s, end_s = layer_spec.split("-", 1)
+            start_layer = int(start_s)
+            end_layer = int(end_s)
+        else:
+            start_layer = end_layer = int(layer_spec)
+        if start_layer < 1 or end_layer > depth or start_layer > end_layer:
+            raise ValueError(f"Layer range {layer_spec!r} is outside valid 1-{depth}")
+        for layer in range(start_layer, end_layer + 1):
+            ratios[layer - 1] = ratio
+    return ratios
 
 
 def _target_grid(grid_h: int, grid_w: int, retention_ratio: float) -> tuple[int, int]:
