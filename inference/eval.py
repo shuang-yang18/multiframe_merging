@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -10,8 +11,12 @@ import numpy as np
 
 from PIL import Image
 
-from vggt_omega.evaluation import preprocess_depth as preprocess_raw_depth
-from vggt_omega.evaluation import preprocess_bonn_depth, preprocess_sintel_depth, write_csv
+from vggt_omega.evaluation import read_bonn_depth, read_sintel_depth, write_csv
+
+try:
+    import cv2
+except ImportError:  # pragma: no cover - runtime fallback for minimal environments.
+    cv2 = None
 
 if __package__:
     from .infer import DEFAULT_DATASET_ROOTS, sequence_images, sequence_names, sequence_poses
@@ -30,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pred-dir", default="outputs/video_depth")
     parser.add_argument("--output-dir", default="outputs/video_depth")
     parser.add_argument("--align", choices=["metric", "scale", "scale_shift"], default="scale_shift")
-    parser.add_argument("--max-depth", type=float, default=70.0)
+    parser.add_argument("--max-depth", type=float, default=None)
     parser.add_argument(
         "--pose-eval-frames",
         type=int,
@@ -51,11 +56,37 @@ def parse_args() -> argparse.Namespace:
         help="7Scenes split to use when --dataset 7scenes. Defaults to the official test split.",
     )
     parser.add_argument("--max-frames-per-seq", type=int, default=0)
+    parser.add_argument(
+        "--frame-sample-mode",
+        choices=["first", "random"],
+        default="first",
+        help="How to choose frames when --max-frames-per-seq is set.",
+    )
+    parser.add_argument("--frame-sample-seed", type=int, default=0, help="Seed for random frame input sampling.")
     return parser.parse_args()
 
 
-def limit_frames(paths: list[str], max_frames: int) -> list[str]:
-    return paths[:max_frames] if max_frames and max_frames > 0 else paths
+def _sequence_seed(seed: int, sequence: str | None) -> int:
+    if not sequence:
+        return seed
+    digest = hashlib.sha1(sequence.encode("utf-8")).digest()
+    return (seed + int.from_bytes(digest[:4], "little")) % (2**32)
+
+
+def limit_frames(
+    paths: list[str],
+    max_frames: int,
+    sample_mode: str = "first",
+    seed: int = 0,
+    sequence: str | None = None,
+) -> list[str]:
+    if not max_frames or max_frames <= 0 or len(paths) <= max_frames:
+        return paths
+    if sample_mode == "random":
+        rng = np.random.default_rng(_sequence_seed(seed, sequence))
+        indices = sorted(rng.choice(len(paths), size=max_frames, replace=False).tolist())
+        return [paths[index] for index in indices]
+    return paths[:max_frames]
 
 
 def read_png_depth(filename: str | Path, scale: float) -> np.ndarray:
@@ -63,6 +94,18 @@ def read_png_depth(filename: str | Path, scale: float) -> np.ndarray:
     depth = raw.astype(np.float32) / scale
     depth[raw == 0] = -1.0
     return depth
+
+
+DEFAULT_MAX_DEPTHS = {
+    "sintel": 70.0,
+    "bonn": 70.0,
+    "tum_dynamic": 70.0,
+    "7scenes": 10.0,
+}
+
+
+def resolve_max_depth(dataset: str, max_depth: float | None) -> float:
+    return DEFAULT_MAX_DEPTHS[dataset] if max_depth is None else max_depth
 
 
 def _timestamp(path: str | Path) -> float:
@@ -116,63 +159,80 @@ def preprocess_depth(
     dataset: str, image_filename: str, depth_filename: str, resolution: tuple[int, int]
 ) -> np.ndarray:
     if dataset == "sintel":
-        return preprocess_sintel_depth(image_filename, depth_filename, resolution)
+        return read_sintel_depth(depth_filename).astype(np.float32)
     if dataset == "7scenes":
-        return preprocess_raw_depth(image_filename, read_png_depth(depth_filename, 1000.0), resolution)
+        raw = np.asarray(Image.open(depth_filename))
+        depth = raw.astype(np.float32) / 1000.0
+        depth[(raw == 0) | (raw == 65535)] = -1.0
+        return depth
     if dataset == "tum_dynamic":
-        return preprocess_raw_depth(image_filename, read_png_depth(depth_filename, 5000.0), resolution)
-    return preprocess_bonn_depth(image_filename, depth_filename, resolution)
+        return read_png_depth(depth_filename, 5000.0)
+    return read_bonn_depth(depth_filename).astype(np.float32)
+
+
+def resize_prediction_to_gt(prediction: np.ndarray, ground_truth: np.ndarray) -> np.ndarray:
+    if prediction.shape == ground_truth.shape:
+        return prediction.astype(np.float32, copy=False)
+    height, width = ground_truth.shape
+    if cv2 is not None:
+        return cv2.resize(prediction.astype(np.float32), (width, height), interpolation=cv2.INTER_CUBIC)
+    image = Image.fromarray(prediction.astype(np.float32), mode="F")
+    return np.asarray(image.resize((width, height), Image.Resampling.BICUBIC), dtype=np.float32)
 
 
 def align_depth(pred: np.ndarray, gt: np.ndarray, mode: str) -> np.ndarray:
     if mode == "metric":
         return pred
     if mode == "scale":
-        scale = np.median(gt) / max(np.median(pred), 1e-8)
+        scale = np.mean(gt) / max(np.mean(pred), 1e-8)
+        for _ in range(10):
+            residual = pred * scale - gt
+            weights = 1.0 / np.maximum(np.abs(residual), 1e-8)
+            denom = np.sum(weights * pred * pred)
+            if denom <= 1e-12:
+                break
+            scale = max(float(np.sum(weights * pred * gt) / denom), 1e-3)
         return pred * scale
-    if pred.size > 200_000:
-        sample_idx = np.linspace(0, pred.size - 1, 200_000, dtype=np.int64)
-        fit_pred, fit_gt = pred[sample_idx], gt[sample_idx]
-    else:
-        fit_pred, fit_gt = pred, gt
-    design = np.column_stack([fit_pred, np.ones_like(fit_pred)])
-    params = np.array([np.median(fit_gt) / max(np.median(fit_pred), 1e-8), 0.0])
-    for _ in range(20):
-        residual = design @ params - fit_gt
-        weights = 1.0 / np.maximum(np.abs(residual), 1e-4)
-        sw = weights.sum()
-        sx = np.dot(weights, fit_pred)
-        sy = np.dot(weights, fit_gt)
-        sxx = np.dot(weights, fit_pred * fit_pred)
-        mean_x = sx / sw
-        mean_y = sy / sw
-        centered_x = fit_pred - mean_x
-        variance_x = np.dot(weights, centered_x * centered_x)
-        tolerance = np.finfo(np.float64).eps * max(abs(sxx), 1.0)
-        if variance_x <= tolerance:
-            weighted_design = design * np.sqrt(weights)[:, None]
-            weighted_gt = fit_gt * np.sqrt(weights)
-            params = np.linalg.lstsq(weighted_design, weighted_gt, rcond=None)[0]
-        else:
-            scale = np.dot(weights, centered_x * (fit_gt - mean_y)) / variance_x
-            params = np.array([scale, mean_y - scale * mean_x])
-    return params[0] * pred + params[1]
+
+    scale = np.median(gt) / max(np.median(pred), 1e-8)
+    shift = 0.0
+    m_scale = v_scale = 0.0
+    m_shift = v_shift = 0.0
+    beta1 = 0.9
+    beta2 = 0.999
+    lr = 1e-4
+    eps = 1e-8
+    inv_n = 1.0 / max(pred.size, 1)
+    for step in range(1, 1001):
+        residual = pred * scale + shift - gt
+        signed = np.sign(residual)
+        grad_scale = float(np.sum(signed * pred) * inv_n)
+        grad_shift = float(np.sum(signed) * inv_n)
+        m_scale = beta1 * m_scale + (1.0 - beta1) * grad_scale
+        v_scale = beta2 * v_scale + (1.0 - beta2) * grad_scale * grad_scale
+        m_shift = beta1 * m_shift + (1.0 - beta1) * grad_shift
+        v_shift = beta2 * v_shift + (1.0 - beta2) * grad_shift * grad_shift
+        scale -= lr * (m_scale / (1.0 - beta1**step)) / (np.sqrt(v_scale / (1.0 - beta2**step)) + eps)
+        shift -= lr * (m_shift / (1.0 - beta1**step)) / (np.sqrt(v_shift / (1.0 - beta2**step)) + eps)
+    return scale * pred + shift
 
 
 def depth_metrics(prediction: np.ndarray, ground_truth: np.ndarray, mode: str, max_depth: float) -> dict:
-    mask = np.isfinite(prediction) & np.isfinite(ground_truth) & (ground_truth > 0) & (ground_truth < max_depth)
+    mask = np.isfinite(ground_truth) & (ground_truth > 0) & (ground_truth < max_depth)
     pred = prediction[mask].astype(np.float64)
     gt = ground_truth[mask].astype(np.float64)
     if pred.size == 0:
         raise ValueError("No valid depth pixels available for evaluation.")
     pred = align_depth(pred, gt, mode)
-    pred = np.clip(pred, 1e-5, max_depth)
+    log_pred = np.maximum(pred, 1e-5)
     ratio = np.maximum(pred / gt, gt / pred)
     return {
+        "depth_eval_protocol": "pi3_videodepth",
         "Abs Rel": float(np.mean(np.abs(pred - gt) / gt)),
         "Sq Rel": float(np.mean((pred - gt) ** 2 / gt)),
         "RMSE": float(np.sqrt(np.mean((pred - gt) ** 2))),
-        "Log RMSE": float(np.sqrt(np.mean((np.log(pred) - np.log(gt)) ** 2))),
+        "Log RMSE": float(np.sqrt(np.mean((np.log(log_pred) - np.log(gt)) ** 2))),
+        "delta < 1.": float(np.mean(ratio < 1.0)),
         "delta < 1.25": float(np.mean(ratio < 1.25)),
         "delta < 1.25^2": float(np.mean(ratio < 1.25**2)),
         "delta < 1.25^3": float(np.mean(ratio < 1.25**3)),
@@ -194,10 +254,19 @@ def evaluate_dataset(args: argparse.Namespace, dataset: str) -> dict:
     sequence_rows = []
 
     for seq in sequences:
-        images = limit_frames(sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir), args.max_frames_per_seq)
+        images = limit_frames(
+            sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir),
+            args.max_frames_per_seq,
+            args.frame_sample_mode,
+            args.frame_sample_seed,
+            seq,
+        )
         gt_paths = limit_frames(
             sequence_depths(dataset, dataset_root, seq, args.bonn_depth_dir, args.bonn_rgb_dir),
             args.max_frames_per_seq,
+            args.frame_sample_mode,
+            args.frame_sample_seed,
+            seq,
         )
         pred_paths = sorted((pred_root / seq).glob("frame_*.npy"))
         if not (len(pred_paths) == len(gt_paths) == len(images)):
@@ -208,11 +277,10 @@ def evaluate_dataset(args: argparse.Namespace, dataset: str) -> dict:
         with (pred_root / seq / "_time.json").open() as handle:
             timing = json.load(handle)
         width, height = timing["resolution"]
-        pred = np.stack([np.load(path) for path in pred_paths])
-        gt = np.stack(
-            [preprocess_depth(dataset, image, depth, (width, height)) for image, depth in zip(images, gt_paths)]
-        )
-        row = {"sequence": seq, **depth_metrics(pred, gt, args.align, args.max_depth)}
+        gt_frames = [preprocess_depth(dataset, image, depth, (width, height)) for image, depth in zip(images, gt_paths)]
+        pred = np.stack([resize_prediction_to_gt(np.load(path), gt) for path, gt in zip(pred_paths, gt_frames)])
+        gt = np.stack(gt_frames)
+        row = {"sequence": seq, **depth_metrics(pred, gt, args.align, resolve_max_depth(dataset, args.max_depth))}
         row["frames"] = timing["frames"]
         row["time"] = timing["time"]
         row["fps"] = timing.get("fps", timing["frames"] / timing["time"])
@@ -267,13 +335,14 @@ def evaluate_dataset(args: argparse.Namespace, dataset: str) -> dict:
             "token_merging_flashvid_alpha",
             "token_merging_flashvid_expansion",
             "token_merging_flashvid_pool_stride",
+            "depth_eval_protocol",
         }
     }
     total_frames = int(sum(row["frames"] for row in sequence_rows))
     total_time = float(sum(row["time"] for row in sequence_rows))
     summary["frames"] = total_frames
     summary["time"] = total_time
-    summary["fps"] = total_frames / total_time if total_time > 0 else None
+    summary["fps"] = float(np.average([row["fps"] for row in sequence_rows]))
     summary["seconds_per_frame"] = total_time / total_frames if total_frames > 0 else None
     allocated_peaks = [row["peak_memory_allocated_gb"] for row in sequence_rows if row["peak_memory_allocated_gb"] is not None]
     reserved_peaks = [row["peak_memory_reserved_gb"] for row in sequence_rows if row["peak_memory_reserved_gb"] is not None]
@@ -353,7 +422,13 @@ def evaluate_dataset(args: argparse.Namespace, dataset: str) -> dict:
     for seq in sequences:
         pose_path = pred_root / seq / "_pose_auc.json"
         pred_pose_path = pred_root / seq / "pred_poses.npy"
-        images = limit_frames(sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir), args.max_frames_per_seq)
+        images = limit_frames(
+            sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir),
+            args.max_frames_per_seq,
+            args.frame_sample_mode,
+            args.frame_sample_seed,
+            seq,
+        )
         gt_poses = sequence_poses(dataset, dataset_root, seq, len(images), images)
         if pred_pose_path.is_file() and gt_poses is not None:
             pred_poses = np.load(pred_pose_path)

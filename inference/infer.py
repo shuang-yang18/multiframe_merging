@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 from pathlib import Path
 
@@ -183,7 +184,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--pose-eval-seed", type=int, default=0, help="Seed for deterministic pose-AUC frame sampling.")
-    parser.add_argument("--max-depth", type=float, default=70.0)
+    parser.add_argument("--max-depth", type=float, default=None)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--all-scenes", action="store_true", default=True, help="Run every scene available in the dataset root.")
     parser.add_argument("--sequences", nargs="*")
@@ -194,6 +195,13 @@ def parse_args() -> argparse.Namespace:
         help="7Scenes split to use when --dataset 7scenes. Defaults to the official test split.",
     )
     parser.add_argument("--max-frames-per-seq", type=int, default=0, help="Limit each sequence to this many frames after stride.")
+    parser.add_argument(
+        "--frame-sample-mode",
+        choices=["first", "random"],
+        default="first",
+        help="How to choose frames when --max-frames-per-seq is set.",
+    )
+    parser.add_argument("--frame-sample-seed", type=int, default=0, help="Seed for random frame input sampling.")
     return parser.parse_args()
 
 
@@ -312,8 +320,27 @@ def sequence_images(dataset: str, dataset_root: str | Path, seq: str, bonn_rgb_d
     return [str(path) for path in paths]
 
 
-def limit_frames(paths: list[str], max_frames: int) -> list[str]:
-    return paths[:max_frames] if max_frames and max_frames > 0 else paths
+def _sequence_seed(seed: int, sequence: str | None) -> int:
+    if not sequence:
+        return seed
+    digest = hashlib.sha1(sequence.encode("utf-8")).digest()
+    return (seed + int.from_bytes(digest[:4], "little")) % (2**32)
+
+
+def limit_frames(
+    paths: list[str],
+    max_frames: int,
+    sample_mode: str = "first",
+    seed: int = 0,
+    sequence: str | None = None,
+) -> list[str]:
+    if not max_frames or max_frames <= 0 or len(paths) <= max_frames:
+        return paths
+    if sample_mode == "random":
+        rng = np.random.default_rng(_sequence_seed(seed, sequence))
+        indices = sorted(rng.choice(len(paths), size=max_frames, replace=False).tolist())
+        return [paths[index] for index in indices]
+    return paths[:max_frames]
 
 
 def _read_tum_poses(path: Path) -> np.ndarray:
@@ -344,7 +371,10 @@ def sequence_poses(
 ) -> np.ndarray | None:
     root = Path(dataset_root)
     if dataset == "7scenes":
-        paths = sorted((root / seq).glob("*.pose.txt"))[:frame_count]
+        if image_paths is not None:
+            paths = [Path(path).with_name(Path(path).name.replace(".color.png", ".pose.txt")) for path in image_paths]
+        else:
+            paths = sorted((root / seq).glob("*.pose.txt"))[:frame_count]
         if not paths:
             return None
         return np.stack([np.loadtxt(path) for path in paths])
@@ -414,9 +444,9 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
     if not args.eval:
         return
     if __package__:
-        from .eval import depth_metrics, preprocess_depth, sequence_depths
+        from .eval import depth_metrics, preprocess_depth, resize_prediction_to_gt, resolve_max_depth, sequence_depths
     else:
-        from eval import depth_metrics, preprocess_depth, sequence_depths
+        from eval import depth_metrics, preprocess_depth, resize_prediction_to_gt, resolve_max_depth, sequence_depths
 
     sequence_rows = []
     sequences = sequence_names(
@@ -428,11 +458,17 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
         args.bonn_rgb_dir,
     )
     for seq in tqdm(sequences, desc=f"VGGT-Omega {dataset} video depth eval"):
-        images = limit_frames(sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir), args.max_frames_per_seq)
+        images = limit_frames(
+            sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir),
+            args.max_frames_per_seq,
+            args.frame_sample_mode,
+            args.frame_sample_seed,
+            seq,
+        )
         gt_paths = sequence_depths(dataset, dataset_root, seq, args.bonn_depth_dir, args.bonn_rgb_dir)
         seq_dir = output_root / seq
         pred_paths = sorted(seq_dir.glob("frame_[0-9][0-9][0-9][0-9].npy"))
-        gt_paths = limit_frames(gt_paths, args.max_frames_per_seq)
+        gt_paths = limit_frames(gt_paths, args.max_frames_per_seq, args.frame_sample_mode, args.frame_sample_seed, seq)
         if not (len(pred_paths) == len(gt_paths) == len(images)):
             raise ValueError(
                 f"{dataset}/{seq}: found {len(pred_paths)} predictions, "
@@ -441,11 +477,10 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
         with (seq_dir / "_time.json").open() as handle:
             timing = json.load(handle)
         width, height = timing["resolution"]
-        pred = np.stack([np.load(path) for path in pred_paths])
-        gt = np.stack(
-            [preprocess_depth(dataset, image, depth, (width, height)) for image, depth in zip(images, gt_paths)]
-        )
-        row = {"sequence": seq, **depth_metrics(pred, gt, args.eval_align, args.max_depth)}
+        gt_frames = [preprocess_depth(dataset, image, depth, (width, height)) for image, depth in zip(images, gt_paths)]
+        pred = np.stack([resize_prediction_to_gt(np.load(path), gt) for path, gt in zip(pred_paths, gt_frames)])
+        gt = np.stack(gt_frames)
+        row = {"sequence": seq, **depth_metrics(pred, gt, args.eval_align, resolve_max_depth(dataset, args.max_depth))}
         row["frames"] = timing["frames"]
         row["time"] = timing["time"]
         row["fps"] = timing.get("fps", timing["frames"] / timing["time"])
@@ -553,6 +588,7 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
             "omega_accelerator",
             "sparse_vggt_pool_mode",
             "da_vggt_sampling_method",
+            "depth_eval_protocol",
         }
         and all(isinstance(row.get(key), (int, float)) and row.get(key) is not None for row in sequence_rows)
     }
@@ -564,7 +600,7 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
             "sequences": len(sequence_rows),
             "frames": total_frames,
             "time": total_time,
-            "fps": total_frames / total_time if total_time > 0 else None,
+            "fps": float(np.average([row["fps"] for row in sequence_rows])),
             "seconds_per_frame": total_time / total_frames if total_frames > 0 else None,
             "peak_memory_allocated_gb": max(
                 row["peak_memory_allocated_gb"] for row in sequence_rows if row["peak_memory_allocated_gb"] is not None
@@ -626,7 +662,13 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
     for seq in sequences:
         pose_path = output_root / seq / "_pose_auc.json"
         pred_pose_path = output_root / seq / "pred_poses.npy"
-        images = limit_frames(sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir), args.max_frames_per_seq)
+        images = limit_frames(
+            sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir),
+            args.max_frames_per_seq,
+            args.frame_sample_mode,
+            args.frame_sample_seed,
+            seq,
+        )
         gt_poses = sequence_poses(dataset, dataset_root, seq, len(images), images)
         if pred_pose_path.is_file() and gt_poses is not None:
             pred_poses = np.load(pred_pose_path)
@@ -739,7 +781,13 @@ def main() -> None:
         output_root = Path(args.output_dir) / dataset
 
         for seq in tqdm(sequences, desc=f"VGGT-Omega {dataset} video depth"):
-            images = limit_frames(sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir), args.max_frames_per_seq)
+            images = limit_frames(
+                sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir),
+                args.max_frames_per_seq,
+                args.frame_sample_mode,
+                args.frame_sample_seed,
+                seq,
+            )
             output_dir = output_root / seq
             time_path = output_dir / "_time.json"
             if (
@@ -796,8 +844,9 @@ def main() -> None:
                         "bonn_depth_dir": args.bonn_depth_dir,
                         "pose_eval_frames": args.pose_eval_frames,
                         "pose_eval_seed": args.pose_eval_seed,
-            "bonn_rgb_dir": args.bonn_rgb_dir,
-            "bonn_depth_dir": args.bonn_depth_dir,
+                        "frame_sample_mode": args.frame_sample_mode,
+                        "frame_sample_seed": args.frame_sample_seed,
+                        "sampled_frames": [Path(image).name for image in images],
                         "inter_frame_attention": args.inter_frame_attention,
                         "register_patch_sample_tokens": args.register_patch_sample_tokens,
                         "register_patch_sample_ratio": args.register_patch_sample_ratio,
