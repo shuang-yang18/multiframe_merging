@@ -14,6 +14,11 @@ from PIL import Image
 from vggt_omega.evaluation import read_bonn_depth, read_sintel_depth, write_csv
 
 try:
+    import torch
+except ImportError:  # pragma: no cover - offline metric-only environments may not have torch.
+    torch = None
+
+try:
     import cv2
 except ImportError:  # pragma: no cover - runtime fallback for minimal environments.
     cv2 = None
@@ -195,6 +200,21 @@ def align_depth(pred: np.ndarray, gt: np.ndarray, mode: str) -> np.ndarray:
         return pred * scale
 
     scale = np.median(gt) / max(np.median(pred), 1e-8)
+    if torch is not None and torch.cuda.is_available():
+        device = torch.device("cuda")
+        pred_t = torch.from_numpy(pred.astype(np.float32, copy=False)).to(device)
+        gt_t = torch.from_numpy(gt.astype(np.float32, copy=False)).to(device)
+        scale_t = torch.tensor(float(scale), dtype=torch.float32, device=device, requires_grad=True)
+        shift_t = torch.tensor(0.0, dtype=torch.float32, device=device, requires_grad=True)
+        optimizer = torch.optim.Adam([scale_t, shift_t], lr=1e-4)
+        for _ in range(1000):
+            optimizer.zero_grad(set_to_none=True)
+            loss = torch.mean(torch.abs(pred_t * scale_t + shift_t - gt_t))
+            loss.backward()
+            optimizer.step()
+        aligned = pred_t * scale_t.detach() + shift_t.detach()
+        return aligned.detach().cpu().numpy()
+
     shift = 0.0
     m_scale = v_scale = 0.0
     m_shift = v_shift = 0.0
@@ -219,8 +239,8 @@ def align_depth(pred: np.ndarray, gt: np.ndarray, mode: str) -> np.ndarray:
 
 def depth_metrics(prediction: np.ndarray, ground_truth: np.ndarray, mode: str, max_depth: float) -> dict:
     mask = np.isfinite(ground_truth) & (ground_truth > 0) & (ground_truth < max_depth)
-    pred = prediction[mask].astype(np.float64)
-    gt = ground_truth[mask].astype(np.float64)
+    pred = prediction[mask].astype(np.float32)
+    gt = ground_truth[mask].astype(np.float32)
     if pred.size == 0:
         raise ValueError("No valid depth pixels available for evaluation.")
     pred = align_depth(pred, gt, mode)
