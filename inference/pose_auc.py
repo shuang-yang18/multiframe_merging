@@ -29,9 +29,7 @@ def _translation_angle_deg(
     angle = float(np.degrees(np.arccos(np.sqrt(1.0 - loss))))
     if not np.isfinite(angle):
         return float(default_err)
-    if ambiguity:
-        angle = min(angle, abs(180.0 - angle))
-    return angle
+    return min(angle, abs(180.0 - angle)) if ambiguity else angle
 
 
 def _auc(errors: list[float], threshold: float) -> float:
@@ -40,8 +38,7 @@ def _auc(errors: list[float], threshold: float) -> float:
     values = np.asarray(errors, dtype=np.float64)
     bins = np.arange(int(threshold) + 1)
     hist, _ = np.histogram(values, bins=bins)
-    normalized_hist = hist.astype(np.float64) / float(len(values))
-    return float(np.mean(np.cumsum(normalized_hist)) * 100.0)
+    return float(np.mean(np.cumsum(hist.astype(np.float64) / float(len(values)))) * 100.0)
 
 
 def _sample_indices(count: int, num_frames: int = 10, seed: int = 0, sequence: str = "") -> np.ndarray:

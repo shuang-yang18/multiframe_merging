@@ -5,17 +5,37 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vggt_omega.models.dynamic_attention_mask import infer_dynamic_patch_mask
+from vggt_omega.models.adaptive_frame_token_fusion import (
+    AdaptiveFusionConfig,
+    build_groups as adaptive_build_groups,
+    frame_representations as adaptive_frame_representations,
+    fuse_frames as adaptive_fuse_frames,
+    merge_tokens as adaptive_merge_tokens,
+    parse_block_list as adaptive_parse_block_list,
+    restore_frames as adaptive_restore_frames,
+    restore_tokens as adaptive_restore_tokens,
+    similarity_matrix as adaptive_similarity_matrix,
+)
 from vggt_omega.models.layers import Mlp, RopePositionEmbedding, SelfAttentionBlock
 from vggt_omega.models.layers.vision_transformer import DinoVisionTransformer
 
 
 _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
+
+
+@dataclass
+class _SegmentPatchBankState:
+    groups: list[list[int]]
+    patch_maps: list[torch.Tensor]
+    summary: dict[str, float | int | list[list[int]]]
 
 
 class Aggregator(nn.Module):
@@ -36,11 +56,10 @@ class Aggregator(nn.Module):
         token_merging_ratio: float = 0.9,
         token_merging_layer_ratios: str = "",
         token_merging_method: str = "spatial",
-        token_merging_tstm_threshold: float = 0.8,
-        token_merging_tstm_neighbor_size: int = 3,
         token_merging_flashvid_alpha: float = 0.7,
         token_merging_flashvid_expansion: float = 1.25,
         token_merging_flashvid_pool_stride: int = 2,
+        token_merging_flashvid_tstm_threshold: float = 0.8,
         token_merging_frame_restore_layer: int = 16,
         token_merging_frame_alpha: float = 0.9,
         token_merging_frame_segment_threshold: float = 0.8,
@@ -53,6 +72,16 @@ class Aggregator(nn.Module):
         token_merging_frame_group_strategy: str = "local",
         token_merging_frame_protect_period: int = 0,
         token_merging_frame_protect_prefix: int = 0,
+        token_merging_frame_anchor_count: int = 4,
+        token_merging_frame_anchor_selection: str = "uniform",
+        token_merging_frame_adaptive_boundary_z: float = 2.5,
+        token_merging_frame_adaptive_medoid_z: float = 1.5,
+        token_merging_frame_patch_fusion_quantile: float = 0.75,
+        token_merging_frame_special_cross_attention: bool = False,
+        token_merging_frame_special_cross_attention_alpha: float = 0.1,
+        token_merging_segment_bank_pair_threshold: float = 0.986,
+        token_merging_segment_bank_span_threshold: float = 0.948,
+        token_merging_segment_bank_max_group_size: int = 4,
         enable_sparse_vggt: bool = False,
         sparse_vggt_sparse_ratio: float | None = 0.5,
         sparse_vggt_cdf_threshold: float | None = None,
@@ -63,6 +92,31 @@ class Aggregator(nn.Module):
         da_vggt_n_anchors: int = 1,
         da_vggt_dino_batch_size: int = 256,
         da_vggt_lambda_div: float = 0.0,
+        dynamic_fastvggt_schedule: str = "all",
+        skip_global_attention_blocks: str = "",
+        skip_inter_frame_attention_blocks: str = "",
+        frame_only_inter_frame_blocks: str = "",
+        enable_adaptive_frame_token_fusion: bool = False,
+        adaptive_frame_representation: str = "global_pool",
+        adaptive_representation_pca_dim: int = 512,
+        adaptive_representation_clusters: int = 3,
+        adaptive_spatial_grid: int = 4,
+        adaptive_grouping: str = "serial",
+        adaptive_reference_selection: str = "first",
+        adaptive_reference_participates: bool = True,
+        adaptive_group_similarity_threshold: float = 0.98,
+        adaptive_group_max_size: int = 4,
+        adaptive_parallel_window: int = 10,
+        adaptive_update_policy: str = "initial_only",
+        adaptive_update_after_blocks: str = "9,17",
+        adaptive_frame_fusion: str = "direct",
+        adaptive_frame_fusion_weighting: str = "similarity",
+        adaptive_frame_token_similarity_threshold: float = 0.95,
+        adaptive_token_merging: str = "fast_bipartite",
+        adaptive_token_keep_ratio: float = 0.1,
+        adaptive_token_clusters: int = 4,
+        adaptive_token_cluster_budget: str = "proportional",
+        adaptive_token_kmeans_iterations: int = 12,
     ) -> None:
         super().__init__()
 
@@ -122,17 +176,12 @@ class Aggregator(nn.Module):
         self.token_merging_layer_ratios = token_merging_layer_ratios
         self._token_merging_layer_ratio_map = _parse_layer_ratio_schedule(token_merging_layer_ratios, depth)
         self.token_merging_method = token_merging_method
-        self.token_merging_tstm_threshold = token_merging_tstm_threshold
-        if token_merging_tstm_neighbor_size < 0 or (
-            token_merging_tstm_neighbor_size > 0 and token_merging_tstm_neighbor_size % 2 == 0
-        ):
-            raise ValueError("token_merging_tstm_neighbor_size must be 0 for full search or a positive odd integer")
-        self.token_merging_tstm_neighbor_size = token_merging_tstm_neighbor_size
         self.token_merging_flashvid_alpha = token_merging_flashvid_alpha
         self.token_merging_flashvid_expansion = token_merging_flashvid_expansion
         if token_merging_flashvid_pool_stride < 1:
             raise ValueError("token_merging_flashvid_pool_stride must be positive")
         self.token_merging_flashvid_pool_stride = token_merging_flashvid_pool_stride
+        self.token_merging_flashvid_tstm_threshold = token_merging_flashvid_tstm_threshold
         self.token_merging_frame_restore_layer = token_merging_frame_restore_layer
         self.token_merging_frame_alpha = token_merging_frame_alpha
         self.token_merging_frame_segment_threshold = token_merging_frame_segment_threshold
@@ -152,6 +201,21 @@ class Aggregator(nn.Module):
             raise ValueError("token_merging_frame_protect_period/prefix must be non-negative")
         self.token_merging_frame_protect_period = token_merging_frame_protect_period
         self.token_merging_frame_protect_prefix = token_merging_frame_protect_prefix
+        if token_merging_frame_anchor_count < 0:
+            raise ValueError("token_merging_frame_anchor_count must be non-negative")
+        if token_merging_frame_anchor_selection not in {"uniform", "farthest"}:
+            raise ValueError("token_merging_frame_anchor_selection must be 'uniform' or 'farthest'")
+        self.token_merging_frame_anchor_count = token_merging_frame_anchor_count
+        self.token_merging_frame_anchor_selection = token_merging_frame_anchor_selection
+        if token_merging_frame_adaptive_boundary_z < 0.0:
+            raise ValueError("token_merging_frame_adaptive_boundary_z must be non-negative")
+        if token_merging_frame_adaptive_medoid_z < 0.0:
+            raise ValueError("token_merging_frame_adaptive_medoid_z must be non-negative")
+        if not 0.0 <= token_merging_frame_patch_fusion_quantile <= 1.0:
+            raise ValueError("token_merging_frame_patch_fusion_quantile must be in [0, 1]")
+        self.token_merging_frame_adaptive_boundary_z = token_merging_frame_adaptive_boundary_z
+        self.token_merging_frame_adaptive_medoid_z = token_merging_frame_adaptive_medoid_z
+        self.token_merging_frame_patch_fusion_quantile = token_merging_frame_patch_fusion_quantile
         if token_merging_frame_group_strategy not in {
             "local",
             "segment_middle",
@@ -163,14 +227,86 @@ class Aggregator(nn.Module):
                 "'global_cluster', or 'global_top_pairs'"
             )
         self.token_merging_frame_group_strategy = token_merging_frame_group_strategy
-        self.token_merging_protected_fraction = 0.5
+        if token_merging_frame_special_cross_attention_alpha < 0.0:
+            raise ValueError("token_merging_frame_special_cross_attention_alpha must be non-negative")
+        self.token_merging_frame_special_cross_attention = token_merging_frame_special_cross_attention
+        self.token_merging_frame_special_cross_attention_alpha = token_merging_frame_special_cross_attention_alpha
+        if not -1.0 <= token_merging_segment_bank_pair_threshold <= 1.0:
+            raise ValueError("token_merging_segment_bank_pair_threshold must be in [-1, 1]")
+        if not -1.0 <= token_merging_segment_bank_span_threshold <= 1.0:
+            raise ValueError("token_merging_segment_bank_span_threshold must be in [-1, 1]")
+        if not 3 <= token_merging_segment_bank_max_group_size <= 4:
+            raise ValueError("token_merging_segment_bank_max_group_size must be 3 or 4 for V1")
+        self.token_merging_segment_bank_pair_threshold = token_merging_segment_bank_pair_threshold
+        self.token_merging_segment_bank_span_threshold = token_merging_segment_bank_span_threshold
+        self.token_merging_segment_bank_max_group_size = token_merging_segment_bank_max_group_size
         self.last_frame_merge_stats: list[dict[str, float | int | str]] = []
+        self.last_frame_special_cross_attention_stats: list[dict[str, float | int | str]] = []
         self.last_token_merging_stats: list[dict[str, float | int | str]] = []
+        self.last_segment_patch_bank_stats: list[dict[str, float | int | list[list[int]]]] = []
         self.enable_sparse_vggt = enable_sparse_vggt
         self.sparse_vggt_sparse_ratio = sparse_vggt_sparse_ratio
         self.sparse_vggt_cdf_threshold = sparse_vggt_cdf_threshold
         self.sparse_vggt_pool_mode = sparse_vggt_pool_mode
         self.last_sparse_vggt_stats: list[dict[str, float | int | str | None]] = []
+        if adaptive_frame_representation not in {"global_pool", "cluster_center", "spatial_grid"}:
+            raise ValueError("adaptive_frame_representation must be global_pool, cluster_center, or spatial_grid")
+        if adaptive_grouping not in {"serial", "parallel"}:
+            raise ValueError("adaptive_grouping must be serial or parallel")
+        if adaptive_reference_selection not in {"first", "medoid", "diverse"}:
+            raise ValueError("adaptive_reference_selection must be first, medoid, or diverse")
+        if adaptive_update_policy not in {"initial_only", "stage_update", "per_layer_update"}:
+            raise ValueError("adaptive_update_policy must be initial_only, stage_update, or per_layer_update")
+        if adaptive_frame_fusion not in {"direct", "token_wise"}:
+            raise ValueError("adaptive_frame_fusion must be direct or token_wise")
+        if adaptive_token_merging not in {"fast_bipartite", "category_topk_norm"}:
+            raise ValueError("adaptive_token_merging must be fast_bipartite or category_topk_norm")
+        if adaptive_frame_fusion_weighting not in {"uniform", "similarity"}:
+            raise ValueError("adaptive_frame_fusion_weighting must be uniform or similarity")
+        if adaptive_token_cluster_budget not in {"proportional", "dispersion"}:
+            raise ValueError("adaptive_token_cluster_budget must be proportional or dispersion")
+        if adaptive_representation_pca_dim < 1 or adaptive_spatial_grid < 1:
+            raise ValueError("adaptive representation dimensions must be positive")
+        if adaptive_representation_clusters not in {2, 3, 4}:
+            raise ValueError("adaptive_representation_clusters must be 2, 3, or 4")
+        if adaptive_token_clusters not in {3, 4, 5}:
+            raise ValueError("adaptive_token_clusters must be 3, 4, or 5")
+        if adaptive_group_max_size < 2 or adaptive_parallel_window < 1:
+            raise ValueError("adaptive group size must be at least 2 and parallel window positive")
+        if not -1.0 <= adaptive_group_similarity_threshold <= 1.0:
+            raise ValueError("adaptive_group_similarity_threshold must be in [-1, 1]")
+        if not -1.0 <= adaptive_frame_token_similarity_threshold <= 1.0:
+            raise ValueError("adaptive_frame_token_similarity_threshold must be in [-1, 1]")
+        if adaptive_token_kmeans_iterations < 1:
+            raise ValueError("adaptive_token_kmeans_iterations must be positive")
+        if not 0.0 < adaptive_token_keep_ratio <= 1.0:
+            raise ValueError("adaptive_token_keep_ratio must be in (0, 1]")
+        if enable_adaptive_frame_token_fusion and enable_token_merging:
+            raise ValueError("adaptive frame/token fusion is independent; disable legacy token merging when enabling it")
+        self.enable_adaptive_frame_token_fusion = enable_adaptive_frame_token_fusion
+        self.adaptive_fusion_config = AdaptiveFusionConfig(
+            frame_representation=adaptive_frame_representation,
+            representation_pca_dim=adaptive_representation_pca_dim,
+            representation_clusters=adaptive_representation_clusters,
+            spatial_grid=adaptive_spatial_grid,
+            grouping=adaptive_grouping,
+            reference_selection=adaptive_reference_selection,
+            reference_participates=adaptive_reference_participates,
+            group_similarity_threshold=adaptive_group_similarity_threshold,
+            group_max_size=adaptive_group_max_size,
+            parallel_window=adaptive_parallel_window,
+            update_policy=adaptive_update_policy,
+            update_after_blocks=adaptive_parse_block_list(adaptive_update_after_blocks),
+            frame_fusion=adaptive_frame_fusion,
+            frame_fusion_weighting=adaptive_frame_fusion_weighting,
+            frame_token_similarity_threshold=adaptive_frame_token_similarity_threshold,
+            token_merging=adaptive_token_merging,
+            token_keep_ratio=adaptive_token_keep_ratio,
+            token_clusters=adaptive_token_clusters,
+            token_cluster_budget=adaptive_token_cluster_budget,
+            token_kmeans_iterations=adaptive_token_kmeans_iterations,
+        )
+        self.last_adaptive_frame_token_fusion_stats: list[dict[str, object]] = []
         if enable_sparse_vggt:
             from vggt_omega.models.sparse_vggt_attention import check_sparse_vggt_mode
 
@@ -184,6 +320,18 @@ class Aggregator(nn.Module):
         self.da_vggt_n_anchors = da_vggt_n_anchors
         self.da_vggt_dino_batch_size = da_vggt_dino_batch_size
         self.da_vggt_lambda_div = da_vggt_lambda_div
+        if dynamic_fastvggt_schedule not in {"all", "middle", "late", "middle_late"}:
+            raise ValueError("dynamic_fastvggt_schedule must be all/middle/late/middle_late")
+        self.dynamic_fastvggt_schedule = dynamic_fastvggt_schedule
+        self.skip_global_attention_blocks = _parse_block_index_set(skip_global_attention_blocks, depth)
+        self.skip_inter_frame_attention_blocks = _parse_block_index_set(
+            skip_inter_frame_attention_blocks,
+            depth,
+        )
+        self.frame_only_inter_frame_blocks = _parse_block_index_set(frame_only_inter_frame_blocks, depth)
+        overlap = self.skip_inter_frame_attention_blocks & self.frame_only_inter_frame_blocks
+        if overlap:
+            raise ValueError(f"Blocks cannot be both skipped and frame-only: {sorted(overlap)}")
 
         self.inter_frame_attention_types = ["global"] * depth
         if register_attention_block_indices is None:
@@ -205,14 +353,29 @@ class Aggregator(nn.Module):
     def forward(
         self,
         images: torch.Tensor,
+        stop_after_block: int | None = None,
+        capture_camera_attention_block: int | None = None,
+        capture_output_block: int | None = None,
     ) -> tuple[list[torch.Tensor | None], int]:
         batch_size, num_frames, num_channels, height, width = images.shape
+        if stop_after_block is not None and not 0 <= stop_after_block < self.depth:
+            raise ValueError(f"stop_after_block must be in [0, {self.depth - 1}], got {stop_after_block}")
+        if capture_camera_attention_block is not None and not 0 <= capture_camera_attention_block < self.depth:
+            raise ValueError(f"capture_camera_attention_block must be in [0, {self.depth - 1}], got {capture_camera_attention_block}")
+        if capture_output_block is not None and not 0 <= capture_output_block < self.depth:
+            raise ValueError(f"capture_output_block must be in [0, {self.depth - 1}], got {capture_output_block}")
         self.last_frame_merge_stats = []
+        self.last_frame_special_cross_attention_stats = []
         self.last_token_merging_stats = []
+        self.last_segment_patch_bank_stats = []
         self.last_sparse_vggt_stats = []
+        self.last_camera_patch_attention = None
+        self.last_dynamic_attention_mask = None
+        self.last_dynamic_attention_stats = []
         if num_channels != 3:
             raise ValueError(f"Expected 3 input channels, got {num_channels}")
 
+        source_images = images
         images = (images - self._resnet_mean) / self._resnet_std
         images = images.view(batch_size * num_frames, num_channels, height, width)
 
@@ -231,6 +394,14 @@ class Aggregator(nn.Module):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
 
         patch_grid_size = (height // self.patch_size, width // self.patch_size)
+        segment_patch_bank_states = None
+        if self.enable_token_merging and self.token_merging_method == "segment_patch_bank":
+            patch_tokens_view = patch_tokens.view(batch_size, num_frames, patch_tokens.shape[1], patch_tokens.shape[2])
+            segment_patch_bank_states = [
+                self._build_segment_patch_bank(patch_tokens_view[batch_idx], patch_grid_size)
+                for batch_idx in range(batch_size)
+            ]
+            self.last_segment_patch_bank_stats = [state.summary for state in segment_patch_bank_states]
         original_patch_tokens = None
         flashvid_inverse = None
         flashvid_merge_centers = None
@@ -273,7 +444,11 @@ class Aggregator(nn.Module):
 
         outputs = []
         frame_merge_state = None
+        frame_special_cross_memory = None
         active_num_frames = num_frames
+        dynamic_patch_masks = None
+        adaptive_group_cache = None
+        self.last_adaptive_frame_token_fusion_stats = []
         for block_idx in range(self.depth):
             if (
                 frame_merge_state is not None
@@ -283,13 +458,66 @@ class Aggregator(nn.Module):
                     "frame_persistent_spatial",
                     "frame_persistent_decoupled",
                     "frame_persistent_decoupled_window",
+                    "frame_anchor_hybrid",
+                    "frame_anchor_adaptive",
+                    "frame_anchor_adaptive_spatial",
                 }
                 and block_idx == self.token_merging_frame_restore_layer
             ):
                 tokens = _restore_frame_tokens(tokens, frame_merge_state)
                 frame_merge_state = None
+                frame_special_cross_memory = None
                 active_num_frames = num_frames
 
+            # The hybrid path selects anchors from DINO patch tokens and compresses
+            # before its first active aggregator block, unlike the legacy persistent path.
+            if (
+                self.enable_token_merging
+                and self.token_merging_method in {"frame_anchor_hybrid", "frame_anchor_adaptive", "frame_anchor_adaptive_spatial"}
+                and block_idx == self.token_merging_start
+                and block_idx < self.token_merging_frame_restore_layer
+                and frame_merge_state is None
+            ):
+                # Before the first frame block tokens are still flattened as
+                # [B * F, N, C]; frame-level merging operates on [B, F, N, C].
+                tokens = tokens.view(batch_size, num_frames, num_tokens, embed_dim)
+                pre_merge_tokens = tokens
+                tokens, frame_merge_state = self._frame_merge(tokens, patch_grid_size)
+                self._record_frame_merge_stats(block_idx, self.token_merging_method, num_frames, frame_merge_state.states)
+                if self.token_merging_frame_special_cross_attention:
+                    frame_special_cross_memory = pre_merge_tokens[:, :, : self.patch_token_start].contiguous()
+                active_num_frames = tokens.shape[1]
+
+            capture_camera_attention = (
+                block_idx == capture_camera_attention_block
+                or (
+                    self.token_merging_method in {"dynamic_spatial", "dynamic_spatial_hybrid"}
+                    and block_idx == 4
+                )
+            )
+            if capture_camera_attention and self.inter_frame_attention_types[block_idx] != "global":
+                raise ValueError("Camera-patch attention can only be captured from a global inter-frame attention block")
+            if capture_camera_attention and self.enable_adaptive_frame_token_fusion:
+                raise ValueError(
+                    "Camera-patch attention capture is unavailable while adaptive frame/token fusion packs global tokens"
+                )
+            attention_block = self.inter_frame_blocks[block_idx]
+            skip_inter_frame_attention = (
+                block_idx in self.skip_inter_frame_attention_blocks
+                or (
+                    self.inter_frame_attention_types[block_idx] == "global"
+                    and block_idx in self.skip_global_attention_blocks
+                )
+            )
+            frame_only_inter_frame = block_idx in self.frame_only_inter_frame_blocks
+            if (skip_inter_frame_attention or frame_only_inter_frame) and capture_camera_attention:
+                raise ValueError(f"Cannot capture camera attention from non-global inter-frame block {block_idx}")
+            if capture_camera_attention:
+                attention_block.attn.capture_query_attention_indices = torch.arange(
+                    active_num_frames,
+                    device=tokens.device,
+                ) * num_tokens
+                attention_block.attn.last_query_attention = None
             tokens, frame_tokens = self._run_frame_block(
                 tokens,
                 batch_size,
@@ -299,21 +527,101 @@ class Aggregator(nn.Module):
                 block_idx,
                 frame_rope,
             )
-            tokens = self._run_inter_frame_attention_block(
-                tokens,
-                batch_size,
-                active_num_frames,
-                num_frames,
-                num_tokens,
-                embed_dim,
-                block_idx,
-                self.inter_frame_attention_types[block_idx],
-                patch_grid_size,
-                _frame_dynamic_masks(frame_merge_state, active_num_frames, tokens.device)
-                if frame_merge_state is not None
-                else None,
-            )
-            if block_idx in self.cached_layer_indices:
+            if frame_only_inter_frame:
+                tokens = self._run_inter_frame_block_as_frame_attention(
+                    tokens,
+                    batch_size,
+                    active_num_frames,
+                    num_tokens,
+                    embed_dim,
+                    block_idx,
+                    frame_rope,
+                )
+            elif (
+                self.enable_adaptive_frame_token_fusion
+                and self.inter_frame_attention_types[block_idx] == "global"
+                and not skip_inter_frame_attention
+            ):
+                tokens, adaptive_group_cache = self._run_adaptive_frame_token_global_attention(
+                    tokens,
+                    batch_size=batch_size,
+                    num_frames=num_frames,
+                    num_tokens=num_tokens,
+                    embed_dim=embed_dim,
+                    block_idx=block_idx,
+                    patch_grid_size=patch_grid_size,
+                    group_cache=adaptive_group_cache,
+                )
+            elif not skip_inter_frame_attention:
+                try:
+                    tokens = self._run_inter_frame_attention_block(
+                        tokens,
+                        batch_size,
+                        active_num_frames,
+                        num_frames,
+                        num_tokens,
+                        embed_dim,
+                        block_idx,
+                        self.inter_frame_attention_types[block_idx],
+                        patch_grid_size,
+                        _frame_dynamic_masks(frame_merge_state, active_num_frames, tokens.device)
+                        if frame_merge_state is not None
+                        else None,
+                        _frame_anchor_masks(frame_merge_state, active_num_frames, tokens.device)
+                        if frame_merge_state is not None
+                        else None,
+                        segment_patch_bank_states,
+                        dynamic_patch_masks,
+                    )
+                    if capture_camera_attention:
+                        captured_attention = attention_block.attn.last_query_attention
+                        if captured_attention is None:
+                            raise RuntimeError("Global attention did not return camera attention diagnostics")
+                        expected_tokens = active_num_frames * num_tokens
+                        if captured_attention.shape[-1] != expected_tokens:
+                            raise RuntimeError("Camera attention token layout changed during capture")
+                        camera_attention = captured_attention.view(batch_size, active_num_frames, active_num_frames, num_tokens)
+                        frame_indices = torch.arange(active_num_frames, device=tokens.device)
+                        self.last_camera_patch_attention = camera_attention[
+                            :, frame_indices, frame_indices, self.patch_token_start :
+                        ].detach()
+                finally:
+                    if capture_camera_attention:
+                        attention_block.attn.capture_query_attention_indices = None
+            else:
+                # Inter-frame attention normally returns [B, F, N, C]. Keep
+                # that contract when a global block is intentionally skipped.
+                tokens = tokens.view(batch_size, active_num_frames, num_tokens, embed_dim)
+            if self.token_merging_method in {"dynamic_spatial", "dynamic_spatial_hybrid"} and block_idx == 4:
+                if self.last_camera_patch_attention is None:
+                    raise RuntimeError("Layer-4 dynamic segmentation requires camera-patch attention")
+                dynamic_patch_masks, segmentation_stats = infer_dynamic_patch_mask(
+                    tokens[:, :, self.patch_token_start :],
+                    self.last_camera_patch_attention,
+                    source_images,
+                    patch_grid_size,
+                )
+                self.last_dynamic_attention_mask = dynamic_patch_masks.detach()
+                self.last_dynamic_attention_stats = segmentation_stats
+            if (
+                frame_special_cross_memory is not None
+                and self.inter_frame_attention_types[block_idx] == "global"
+                and self.token_merging_frame_special_cross_attention
+            ):
+                tokens = self._apply_frame_special_cross_attention(
+                    tokens,
+                    frame_special_cross_memory,
+                    self.token_merging_frame_special_cross_attention_alpha,
+                    block_idx,
+                )
+                self.last_frame_special_cross_attention_stats.append(
+                    {
+                        "block": int(block_idx),
+                        "memory_tokens_per_frame": int(self.patch_token_start),
+                        "alpha": float(self.token_merging_frame_special_cross_attention_alpha),
+                    }
+                )
+            if block_idx in self.cached_layer_indices or block_idx == capture_output_block:
                 cache_frame_tokens = frame_tokens
                 cache_tokens = tokens
                 if frame_merge_state is not None:
@@ -331,6 +639,11 @@ class Aggregator(nn.Module):
             else:
                 outputs.append(None)
 
+            # Diagnostic callers can stop as soon as their requested cached
+            # layer is available, leaving regular inference unchanged.
+            if stop_after_block is not None and block_idx == stop_after_block:
+                return outputs, self.patch_token_start
+
             if (
                 self.enable_token_merging
                 and self.token_merging_method
@@ -344,11 +657,106 @@ class Aggregator(nn.Module):
                 and block_idx < self.token_merging_frame_restore_layer
                 and frame_merge_state is None
             ):
+                pre_merge_tokens = tokens
                 tokens, frame_merge_state = self._frame_merge(tokens, patch_grid_size)
                 self._record_frame_merge_stats(block_idx, "persistent", num_frames, frame_merge_state.states)
+                if self.token_merging_frame_special_cross_attention:
+                    frame_special_cross_memory = pre_merge_tokens[:, :, : self.patch_token_start].contiguous()
                 active_num_frames = tokens.shape[1]
 
         return outputs, self.patch_token_start
+
+    def _run_adaptive_frame_token_global_attention(
+        self,
+        tokens: torch.Tensor,
+        *,
+        batch_size: int,
+        num_frames: int,
+        num_tokens: int,
+        embed_dim: int,
+        block_idx: int,
+        patch_grid_size: tuple[int, int],
+        group_cache,
+    ) -> tuple[torch.Tensor, tuple[list[tuple[list[list[int]], list[int]]], int]]:
+        """New independent fusion path: frame fuse -> token merge -> global -> restore."""
+        full_tokens = tokens.view(batch_size, num_frames, num_tokens, embed_dim)
+        config = self.adaptive_fusion_config
+        cached_groups = None if group_cache is None else group_cache[0]
+        previous_stage = -1 if group_cache is None else group_cache[1]
+        current_stage = max((stage for stage in config.update_after_blocks if stage < block_idx), default=-1)
+        should_update = (
+            cached_groups is None
+            or config.update_policy == "per_layer_update"
+            or (config.update_policy == "stage_update" and current_stage > previous_stage)
+        )
+        if should_update:
+            cached_groups = []
+            for batch_idx in range(batch_size):
+                representation = adaptive_frame_representations(
+                    full_tokens[batch_idx],
+                    patch_start=self.patch_token_start,
+                    grid_size=patch_grid_size,
+                    config=config,
+                )
+                matrix = adaptive_similarity_matrix(representation)
+                cached_groups.append(adaptive_build_groups(matrix, config))
+
+        restored_batches = []
+        layer_groups = []
+        for batch_idx in range(batch_size):
+            groups, references = cached_groups[batch_idx]
+            frame_state = adaptive_fuse_frames(
+                full_tokens[batch_idx],
+                groups,
+                references,
+                config,
+                patch_start=self.patch_token_start,
+            )
+            token_state = adaptive_merge_tokens(
+                frame_state.active_inputs,
+                patch_start=self.patch_token_start,
+                grid_size=patch_grid_size,
+                config=config,
+            )
+            compact_output = self.inter_frame_blocks[block_idx](token_state.packed_input.unsqueeze(0), None).squeeze(0)
+            active_output = adaptive_restore_tokens(compact_output, token_state).view(
+                frame_state.active_inputs.shape[0], num_tokens, embed_dim
+            )
+            restored_batches.append(adaptive_restore_frames(active_output, frame_state))
+            layer_groups.append(
+                {
+                    "groups": groups,
+                    "references": references,
+                    "active_frames": int(frame_state.active_inputs.shape[0]),
+                    "original_frames": int(num_frames),
+                    "frame_merge_ratio": float(1.0 - frame_state.active_inputs.shape[0] / num_frames),
+                    "frame_fusion_token_ratio": float(frame_state.active_inputs.shape[0] / num_frames),
+                    "token_active": int(token_state.selected_count),
+                    "token_original": int(token_state.original_count),
+                    "token_retention_ratio": float(token_state.selected_count / token_state.original_count),
+                    "token_merging_over_frame_fused_token_ratio": float(
+                        token_state.selected_count / token_state.original_count
+                    ),
+                    "token_merging_over_pre_frame_token_ratio": float(
+                        token_state.selected_count / (num_frames * num_tokens)
+                    ),
+                }
+            )
+        self.last_adaptive_frame_token_fusion_stats.append(
+            {
+                "block": int(block_idx),
+                "frame_representation": config.frame_representation,
+                "grouping": config.grouping,
+                "reference_selection": config.reference_selection,
+                "reference_participates": config.reference_participates,
+                "frame_fusion": config.frame_fusion,
+                "frame_special_tokens": "protected",
+                "token_merging": config.token_merging,
+                "batches": layer_groups,
+            }
+        )
+        cache_stage = current_stage if should_update else previous_stage
+        return torch.stack(restored_batches).view(batch_size * num_frames, num_tokens, embed_dim), (cached_groups, cache_stage)
 
     def forward_dino(
         self,
@@ -396,6 +804,14 @@ class Aggregator(nn.Module):
         tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
         _, num_tokens, embed_dim = tokens.shape
         patch_grid_size = (height // self.patch_size, width // self.patch_size)
+        segment_patch_bank_states = None
+        if self.enable_token_merging and self.token_merging_method == "segment_patch_bank":
+            patch_tokens_view = patch_tokens.view(batch_size, num_frames, patch_tokens.shape[1], patch_tokens.shape[2])
+            segment_patch_bank_states = [
+                self._build_segment_patch_bank(patch_tokens_view[batch_idx], patch_grid_size)
+                for batch_idx in range(batch_size)
+            ]
+            self.last_segment_patch_bank_stats = [state.summary for state in segment_patch_bank_states]
         with torch.no_grad():
             rope_sin, rope_cos = self.rope_embed(H=patch_grid_size[0], W=patch_grid_size[1])
             frame_rope = (
@@ -414,17 +830,38 @@ class Aggregator(nn.Module):
                 block_idx,
                 frame_rope,
             )
-            tokens = self._run_inter_frame_attention_block(
-                tokens,
-                batch_size,
-                num_frames,
-                num_frames,
-                num_tokens,
-                embed_dim,
-                block_idx,
-                self.inter_frame_attention_types[block_idx],
-                patch_grid_size,
+            skip_inter_frame_attention = (
+                block_idx in self.skip_inter_frame_attention_blocks
+                or (
+                    self.inter_frame_attention_types[block_idx] == "global"
+                    and block_idx in self.skip_global_attention_blocks
+                )
             )
+            if block_idx in self.frame_only_inter_frame_blocks:
+                tokens = self._run_inter_frame_block_as_frame_attention(
+                    tokens,
+                    batch_size,
+                    num_frames,
+                    num_tokens,
+                    embed_dim,
+                    block_idx,
+                    frame_rope,
+                )
+            elif not skip_inter_frame_attention:
+                tokens = self._run_inter_frame_attention_block(
+                    tokens,
+                    batch_size,
+                    num_frames,
+                    num_frames,
+                    num_tokens,
+                    embed_dim,
+                    block_idx,
+                    self.inter_frame_attention_types[block_idx],
+                    patch_grid_size,
+                    segment_patch_bank_states=segment_patch_bank_states,
+                )
+            else:
+                tokens = tokens.view(batch_size, num_frames, num_tokens, embed_dim)
             if block_idx in self.cached_layer_indices:
                 outputs.append(torch.cat([frame_tokens, tokens], dim=-1))
             else:
@@ -445,6 +882,36 @@ class Aggregator(nn.Module):
         tokens = self.frame_blocks[block_idx](tokens, rope_sincos)
         return tokens, tokens.view(batch_size, num_frames, num_tokens, embed_dim)
 
+    def _run_inter_frame_block_as_frame_attention(
+        self,
+        tokens: torch.Tensor,
+        batch_size: int,
+        num_frames: int,
+        num_tokens: int,
+        embed_dim: int,
+        block_idx: int,
+        rope_sincos: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        """Apply an inter-frame block independently inside every frame."""
+        tokens = tokens.view(batch_size * num_frames, num_tokens, embed_dim)
+        tokens = self.inter_frame_blocks[block_idx](tokens, rope_sincos)
+        return tokens.view(batch_size, num_frames, num_tokens, embed_dim)
+
+    def _dynamic_fastvggt_applies(self, block_idx: int, attention_type: str) -> bool:
+        if (
+            attention_type != "global"
+            or self.token_merging_method not in {"dynamic_spatial", "dynamic_spatial_hybrid"}
+            or block_idx <= 4
+        ):
+            return False
+        if self.dynamic_fastvggt_schedule == "all":
+            return True
+        if self.dynamic_fastvggt_schedule == "middle":
+            return 11 <= block_idx <= 17
+        if self.dynamic_fastvggt_schedule == "late":
+            return block_idx >= 18
+        return block_idx >= 11
+
     def _run_inter_frame_attention_block(
         self,
         tokens: torch.Tensor,
@@ -457,10 +924,28 @@ class Aggregator(nn.Module):
         attention_type: str,
         patch_grid_size: tuple[int, int],
         dynamic_frame_masks: torch.Tensor | None = None,
+        anchor_frame_masks: torch.Tensor | None = None,
+        segment_patch_bank_states: list[_SegmentPatchBankState] | None = None,
+        dynamic_patch_masks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         tokens = tokens.view(batch_size, num_frames, num_tokens, embed_dim)
 
         if attention_type == "global":
+            if (
+                self.enable_token_merging
+                and block_idx >= self.token_merging_start
+                and self.token_merging_method == "segment_patch_bank"
+            ):
+                if segment_patch_bank_states is None:
+                    raise RuntimeError("segment_patch_bank requires DINO-derived segment states")
+                return self._run_segment_patch_bank_global_attention(
+                    tokens,
+                    segment_patch_bank_states,
+                    num_frames,
+                    num_tokens,
+                    embed_dim,
+                    block_idx,
+                )
             if (
                 self.enable_token_merging
                 and block_idx >= self.token_merging_start
@@ -499,24 +984,31 @@ class Aggregator(nn.Module):
                 and self.token_merging_method
                 in {
                     "spatial",
-                    "protected_spatial",
                     "frame_persistent_spatial",
                     "frame_persistent_decoupled",
                     "frame_persistent_decoupled_window",
+                    "frame_anchor_adaptive_spatial",
+                    "dynamic_spatial",
+                    "dynamic_spatial_hybrid",
                 }
                 and (
                     self.token_merging_method
                     not in {"frame_persistent_decoupled", "frame_persistent_decoupled_window"}
                     or dynamic_frame_masks is not None
                 )
+                and (
+                    self.token_merging_method != "dynamic_spatial"
+                    or (
+                        dynamic_patch_masks is not None
+                        and self._dynamic_fastvggt_applies(block_idx, attention_type)
+                    )
+                )
             ):
                 tokens = tokens.view(batch_size, num_frames * num_tokens, embed_dim)
                 block = self.inter_frame_blocks[block_idx]
                 layer_ratio = self._token_merging_ratio_for_block(block_idx)
                 block.attn.fastvggt_merge_ratio = layer_ratio
-                if self.token_merging_method == "protected_spatial":
-                    block.attn.fastvggt_protection = "adts"
-                elif self.token_merging_method == "frame_persistent_decoupled_window":
+                if self.token_merging_method == "frame_persistent_decoupled_window":
                     block.attn.fastvggt_protection = "decoupled_window"
                 else:
                     block.attn.fastvggt_protection = "fastvggt"
@@ -529,8 +1021,19 @@ class Aggregator(nn.Module):
                         num_tokens,
                         tokens.device,
                     )
+                elif self.token_merging_method == "frame_anchor_adaptive_spatial":
+                    block.attn.fastvggt_protected_token_indices = _anchor_frame_token_indices(
+                        anchor_frame_masks,
+                        num_tokens,
+                        tokens.device,
+                    )
                 elif self.token_merging_method == "frame_persistent_decoupled_window":
                     block.attn.fastvggt_dynamic_frame_mask = dynamic_frame_masks
+                elif (
+                    self.token_merging_method in {"dynamic_spatial", "dynamic_spatial_hybrid"}
+                    and self._dynamic_fastvggt_applies(block_idx, attention_type)
+                ):
+                    block.attn.fastvggt_dynamic_patch_mask = dynamic_patch_masks
                 try:
                     tokens = block(tokens, None)
                     stats = getattr(block.attn, "last_fastvggt_stats", None)
@@ -542,6 +1045,15 @@ class Aggregator(nn.Module):
                             {
                                 "block": int(block_idx),
                                 "mode": self.token_merging_method,
+                                "merge_variant": (
+                                    "dynamic_constrained"
+                                    if self.token_merging_method == "dynamic_spatial"
+                                    or (
+                                        self.token_merging_method == "dynamic_spatial_hybrid"
+                                        and self._dynamic_fastvggt_applies(block_idx, attention_type)
+                                    )
+                                    else "standard"
+                                ),
                                 "merge_ratio": float(layer_ratio),
                                 "frame_merged_tokens": frame_merged_tokens,
                                 "frame_original_tokens": frame_original_tokens,
@@ -562,22 +1074,9 @@ class Aggregator(nn.Module):
                     block.attn.fastvggt_special_token_count = None
                     block.attn.fastvggt_protected_token_indices = None
                     block.attn.fastvggt_dynamic_frame_mask = None
+                    block.attn.fastvggt_dynamic_patch_mask = None
                 return tokens.view(batch_size, num_frames, num_tokens, embed_dim)
 
-            if (
-                self.enable_token_merging
-                and block_idx >= self.token_merging_start
-                and self.token_merging_method == "tstm"
-            ):
-                return self._run_merged_global_attention(
-                    tokens,
-                    batch_size,
-                    num_frames,
-                    num_tokens,
-                    embed_dim,
-                    block_idx,
-                    patch_grid_size,
-                )
             tokens = tokens.view(batch_size, num_frames * num_tokens, embed_dim)
             if not self.enable_sparse_vggt:
                 tokens = self.inter_frame_blocks[block_idx](tokens, None)
@@ -633,6 +1132,156 @@ class Aggregator(nn.Module):
         )
         return torch.cat([camera_and_register_tokens, patch_tokens], dim=2)
 
+    def _build_segment_patch_bank(
+        self,
+        patch_tokens: torch.Tensor,
+        patch_grid_size: tuple[int, int],
+    ) -> _SegmentPatchBankState:
+        """Create fixed DINO-based segment groups and two-anchor patch maps.
+
+        V1 keeps every frame's camera/register tokens. A coherent segment of
+        three or four frames contributes only two full patch grids to global
+        attention; non-anchor patches route to their nearest local anchor slot.
+        """
+        num_frames, num_patches, _ = patch_tokens.shape
+        grid_h, grid_w = patch_grid_size
+        if num_patches != grid_h * grid_w:
+            raise ValueError("Segment patch bank patch count does not match the patch grid")
+
+        with torch.autocast(device_type=patch_tokens.device.type, enabled=False):
+            features = F.normalize(patch_tokens.detach().float(), dim=-1)
+            descriptors = F.normalize(features.mean(dim=1), dim=-1)
+            groups = _segment_patch_bank_groups(
+                descriptors,
+                pair_threshold=self.token_merging_segment_bank_pair_threshold,
+                span_threshold=self.token_merging_segment_bank_span_threshold,
+                max_group_size=self.token_merging_segment_bank_max_group_size,
+            )
+            patch_maps = []
+            for group in groups:
+                anchor_features = features[torch.tensor([group[0], group[-1]], device=features.device)]
+                patch_maps.append(
+                    _segment_patch_bank_maps(
+                        features[torch.tensor(group, device=features.device)],
+                        anchor_features,
+                        patch_grid_size,
+                    )
+                )
+
+        compressed_frames = sum(len(group) for group in groups)
+        summary = {
+            "num_frames": int(num_frames),
+            "compressed_segments": int(len(groups)),
+            "compressed_frames": int(compressed_frames),
+            "compressed_frame_fraction": float(compressed_frames / num_frames if num_frames else 0.0),
+            "groups": [[int(frame_idx) for frame_idx in group] for group in groups],
+            "group_sizes": [int(len(group)) for group in groups],
+            "pair_threshold": float(self.token_merging_segment_bank_pair_threshold),
+            "span_threshold": float(self.token_merging_segment_bank_span_threshold),
+            "max_group_size": int(self.token_merging_segment_bank_max_group_size),
+            "anchors_per_segment": 2,
+        }
+        return _SegmentPatchBankState(groups, patch_maps, summary)
+
+    def _run_segment_patch_bank_global_attention(
+        self,
+        tokens: torch.Tensor,
+        states: list[_SegmentPatchBankState],
+        num_frames: int,
+        num_tokens: int,
+        embed_dim: int,
+        block_idx: int,
+    ) -> torch.Tensor:
+        """Run global attention over frame specials plus two-grid segment banks.
+
+        The packed sequence is temporary. Every frame receives its original
+        full patch grid again via ``patch_in + bank_out - bank_in`` before the
+        next frame-attention block and before cached heads consume the tokens.
+        """
+        packed_sequences = []
+        records_per_batch = []
+        original_tokens = num_frames * num_tokens
+        patch_tokens_per_frame = num_tokens - self.patch_token_start
+
+        for batch_idx, state in enumerate(states):
+            frame_tokens = tokens[batch_idx]
+            group_by_start = {group[0]: (group, patch_map) for group, patch_map in zip(state.groups, state.patch_maps)}
+            member_frames = {frame_idx for group in state.groups for frame_idx in group}
+            packed_parts = []
+            records = []
+            offset = 0
+            frame_idx = 0
+            while frame_idx < num_frames:
+                group_entry = group_by_start.get(frame_idx)
+                if group_entry is None:
+                    if frame_idx in member_frames:
+                        raise RuntimeError("Segment patch bank group layout is inconsistent")
+                    packed_frame = frame_tokens[frame_idx]
+                    packed_parts.append(packed_frame)
+                    records.append(("frame", frame_idx, offset, packed_frame.shape[0]))
+                    offset += packed_frame.shape[0]
+                    frame_idx += 1
+                    continue
+
+                group, patch_map = group_entry
+                group_indices = torch.tensor(group, dtype=torch.long, device=frame_tokens.device)
+                special = frame_tokens[group_indices, : self.patch_token_start].reshape(-1, embed_dim)
+                patch_input = frame_tokens[group_indices, self.patch_token_start :]
+                bank_input = _aggregate_segment_patch_bank(patch_input, patch_map)
+                packed_parts.extend([special, bank_input])
+                records.append(
+                    (
+                        "segment",
+                        group_indices,
+                        offset,
+                        special.shape[0],
+                        offset + special.shape[0],
+                        patch_map,
+                        patch_input,
+                        bank_input,
+                    )
+                )
+                offset += special.shape[0] + bank_input.shape[0]
+                frame_idx = group[-1] + 1
+            packed_sequences.append(torch.cat(packed_parts, dim=0).unsqueeze(0))
+            records_per_batch.append(records)
+
+        packed_outputs = self.inter_frame_blocks[block_idx](packed_sequences, None)
+        outputs = []
+        for batch_idx, (packed_output, records, state) in enumerate(zip(packed_outputs, records_per_batch, states)):
+            packed_output = packed_output.squeeze(0)
+            restored = torch.empty_like(tokens[batch_idx])
+            for record in records:
+                if record[0] == "frame":
+                    _, frame_idx, start, count = record
+                    restored[frame_idx] = packed_output[start : start + count]
+                    continue
+                _, group_indices, special_start, special_count, bank_start, patch_map, patch_input, bank_input = record
+                special_output = packed_output[special_start : special_start + special_count].view(
+                    group_indices.numel(), self.patch_token_start, embed_dim
+                )
+                bank_output = packed_output[bank_start : bank_start + 2 * patch_tokens_per_frame]
+                patch_output = patch_input + (bank_output - bank_input)[patch_map]
+                restored[group_indices, : self.patch_token_start] = special_output
+                restored[group_indices, self.patch_token_start :] = patch_output
+            outputs.append(restored)
+
+            active_tokens = int(packed_output.shape[0])
+            self.last_token_merging_stats.append(
+                {
+                    "block": int(block_idx),
+                    "mode": "segment_patch_bank",
+                    "original_tokens": int(original_tokens),
+                    "active_tokens": active_tokens,
+                    "full_attention_token_ratio": float(active_tokens / original_tokens if original_tokens else 0.0),
+                    "merged_away_token_ratio": float(1.0 - active_tokens / original_tokens if original_tokens else 0.0),
+                    "compressed_segments": int(len(state.groups)),
+                    "compressed_frames": int(sum(len(group) for group in state.groups)),
+                    "bank_patch_tokens": int(2 * patch_tokens_per_frame * len(state.groups)),
+                }
+            )
+        return torch.stack(outputs, dim=0)
+
     def _run_merged_global_attention(
         self,
         tokens: torch.Tensor,
@@ -685,25 +1334,13 @@ class Aggregator(nn.Module):
         patch_tokens: torch.Tensor,
         patch_grid_size: tuple[int, int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        retention_ratio = _retention_from_merge_ratio(self.token_merging_ratio)
         if self.token_merging_method == "spatial":
             raise AssertionError("spatial merging is applied inside attention like FastVGGT")
-        if self.token_merging_method == "protected_spatial":
-            raise AssertionError("protected_spatial merging is applied inside attention like FastVGGT")
-        if self.token_merging_method == "tstm":
-            return _tstm_merge(
-                patch_tokens,
-                patch_grid_size,
-                retention_ratio,
-                self.token_merging_protected_fraction,
-                self.token_merging_tstm_threshold,
-                self.token_merging_tstm_neighbor_size,
-            )
         raise ValueError(
             f"Unknown token_merging_method={self.token_merging_method!r}; "
-            "expected 'spatial', 'protected_spatial', 'tstm', 'flashvid_encoder', "
+            "expected 'spatial', 'flashvid_encoder', "
             "'frame_temporary', 'frame_persistent', 'frame_persistent_spatial', "
-            "'frame_persistent_decoupled', or 'frame_persistent_decoupled_window'"
+            "'frame_persistent_decoupled', 'frame_persistent_decoupled_window', or 'frame_anchor_hybrid'"
         )
 
     def _token_merging_ratio_for_block(self, block_idx: int) -> float:
@@ -717,7 +1354,7 @@ class Aggregator(nn.Module):
         merged_batches = []
         states = []
         for batch_idx in range(tokens.shape[0]):
-            merged_tokens, state = _frame_merge_one(
+            merge_args = (
                 tokens[batch_idx],
                 self.patch_token_start,
                 patch_grid_size,
@@ -733,12 +1370,64 @@ class Aggregator(nn.Module):
                 self.token_merging_frame_protect_period,
                 self.token_merging_frame_protect_prefix,
             )
+            if self.token_merging_method == "frame_anchor_hybrid":
+                merged_tokens, state = _frame_anchor_hybrid_merge_one(
+                    *merge_args,
+                    anchor_count=self.token_merging_frame_anchor_count,
+                    anchor_selection=self.token_merging_frame_anchor_selection,
+                )
+            elif self.token_merging_method in {"frame_anchor_adaptive", "frame_anchor_adaptive_spatial"}:
+                merged_tokens, state = _frame_anchor_adaptive_merge_one(
+                    tokens[batch_idx],
+                    self.patch_token_start,
+                    patch_grid_size,
+                    self.token_merging_frame_pool_stride,
+                    self.token_merging_frame_adaptive_boundary_z,
+                    self.token_merging_frame_adaptive_medoid_z,
+                    self.token_merging_frame_patch_fusion_quantile,
+                )
+            else:
+                merged_tokens, state = _frame_merge_one(*merge_args)
             merged_batches.append(merged_tokens)
             states.append(state)
         active_counts = {state.active_frames for state in states}
         if len(active_counts) != 1:
             raise ValueError(f"Frame merging produced different active frame counts across batch: {sorted(active_counts)}")
         return torch.stack(merged_batches, dim=0), _BatchFrameMergeState(states)
+
+    def _apply_frame_special_cross_attention(
+        self,
+        tokens: torch.Tensor,
+        memory_tokens: torch.Tensor,
+        alpha: float,
+        block_idx: int,
+    ) -> torch.Tensor:
+        if alpha == 0.0:
+            return tokens
+        batch_size, active_frames, _, embed_dim = tokens.shape
+        special_tokens = tokens[:, :, : self.patch_token_start]
+        if memory_tokens.shape[0] != batch_size or memory_tokens.shape[2] != self.patch_token_start:
+            raise ValueError("Frame special cross-attention memory shape is invalid")
+
+        block = self.inter_frame_blocks[block_idx]
+        attention = block.attn
+        query_input = block.norm1(special_tokens.reshape(batch_size, -1, embed_dim))
+        memory_input = block.norm1(memory_tokens.reshape(batch_size, -1, embed_dim))
+        query_qkv = attention.qkv(query_input)
+        memory_qkv = attention.qkv(memory_input)
+        head_dim = embed_dim // attention.num_heads
+        query = query_qkv.reshape(batch_size, -1, 3, attention.num_heads, head_dim)[:, :, 0].transpose(1, 2)
+        key = memory_qkv.reshape(batch_size, -1, 3, attention.num_heads, head_dim)[:, :, 1].transpose(1, 2)
+        value = memory_qkv.reshape(batch_size, -1, 3, attention.num_heads, head_dim)[:, :, 2].transpose(1, 2)
+        if attention.use_qk_norm:
+            query = attention.q_norm(query)
+            key = attention.k_norm(key)
+        cross_output = F.scaled_dot_product_attention(query, key, value)
+        cross_output = cross_output.transpose(1, 2).reshape(batch_size, active_frames, self.patch_token_start, embed_dim)
+        cross_output = attention.proj(cross_output)
+        cross_output = attention.proj_drop(cross_output)
+        updated_special = special_tokens + alpha * cross_output
+        return torch.cat([updated_special, tokens[:, :, self.patch_token_start :]], dim=2)
 
     def _record_frame_merge_stats(
         self,
@@ -759,6 +1448,9 @@ class Aggregator(nn.Module):
             [[int(frame_idx) for frame_idx in group] for group in state.merge_groups]
             for state in states
         ]
+        anchor_frames = [[int(frame_idx) for frame_idx in state.anchor_indices] for state in states]
+        medoid_frames = [[int(frame_idx) for frame_idx in state.medoid_indices] for state in states]
+        patch_fusion_ratios = [state.patch_fusion_ratio for state in states if state.patch_fusion_ratio is not None]
         frame_to_active = [
             [int(active_idx) for active_idx in state.inverse.detach().cpu().tolist()]
             for state in states
@@ -793,10 +1485,20 @@ class Aggregator(nn.Module):
             "multi_frame_group_size_mean": float(sum(multi_group_sizes) / len(multi_group_sizes))
             if multi_group_sizes
             else 0.0,
-                "frame_group_strategy": self.token_merging_frame_group_strategy,
-                "protect_period": int(self.token_merging_frame_protect_period),
-                "protect_prefix": int(self.token_merging_frame_protect_prefix),
-            }
+            "frame_group_strategy": self.token_merging_frame_group_strategy,
+            "protect_period": int(self.token_merging_frame_protect_period),
+            "protect_prefix": int(self.token_merging_frame_protect_prefix),
+            "anchor_frames": anchor_frames,
+            "anchor_count": int(sum(len(anchors) for anchors in anchor_frames) / len(anchor_frames)),
+            "anchor_selection": self.token_merging_frame_anchor_selection
+            if self.token_merging_method == "frame_anchor_hybrid"
+            else None,
+            "medoid_frames": medoid_frames,
+            "medoid_count": int(sum(len(medoids) for medoids in medoid_frames) / len(medoid_frames)),
+            "patch_fusion_ratio_mean": float(sum(patch_fusion_ratios) / len(patch_fusion_ratios))
+            if patch_fusion_ratios
+            else None,
+        }
         if similarity_matrices:
             stat["similarity_matrices"] = similarity_matrices
         self.last_frame_merge_stats.append(stat)
@@ -816,7 +1518,7 @@ class Aggregator(nn.Module):
             self.token_merging_flashvid_alpha,
             self.token_merging_flashvid_expansion,
             self.token_merging_flashvid_pool_stride,
-            self.token_merging_tstm_threshold,
+            self.token_merging_flashvid_tstm_threshold,
         )
 
     def _restore_flashvid_encoder_tokens(
@@ -836,6 +1538,108 @@ class Aggregator(nn.Module):
         return torch.cat([special_tokens, restored], dim=2)
 
 
+def _segment_patch_bank_groups(
+    descriptors: torch.Tensor,
+    pair_threshold: float,
+    span_threshold: float,
+    max_group_size: int,
+) -> list[list[int]]:
+    """Greedily form contiguous 3--4 frame groups with no chain drift."""
+    num_frames = descriptors.shape[0]
+    groups: list[list[int]] = []
+    start = 0
+    while start < num_frames:
+        group = [start]
+        cursor = start + 1
+        while cursor < num_frames and len(group) < max_group_size:
+            adjacent_similarity = torch.dot(descriptors[cursor - 1], descriptors[cursor])
+            span_similarities = descriptors[torch.tensor(group, device=descriptors.device)] @ descriptors[cursor]
+            if adjacent_similarity < pair_threshold or torch.min(span_similarities) < span_threshold:
+                break
+            group.append(cursor)
+            cursor += 1
+        if len(group) >= 3:
+            groups.append(group)
+            start = cursor
+        else:
+            start += 1
+    return groups
+
+
+def _segment_patch_bank_maps(
+    group_features: torch.Tensor,
+    anchor_features: torch.Tensor,
+    patch_grid_size: tuple[int, int],
+) -> torch.Tensor:
+    """Map every group patch to one of two anchors using a 3x3 local search."""
+    group_size, num_patches, _ = group_features.shape
+    grid_h, grid_w = patch_grid_size
+    if num_patches != grid_h * grid_w:
+        raise ValueError("Segment patch bank mapping patch count does not match the patch grid")
+    device = group_features.device
+    identity = torch.arange(num_patches, device=device, dtype=torch.long)
+    maps = []
+    for frame_idx in range(group_size):
+        if frame_idx == 0:
+            maps.append(identity)
+        elif frame_idx == group_size - 1:
+            maps.append(identity + num_patches)
+        else:
+            maps.append(_local_anchor_patch_assignment(group_features[frame_idx], anchor_features, patch_grid_size))
+    return torch.stack(maps, dim=0)
+
+
+def _local_anchor_patch_assignment(
+    source: torch.Tensor,
+    anchors: torch.Tensor,
+    patch_grid_size: tuple[int, int],
+) -> torch.Tensor:
+    grid_h, grid_w = patch_grid_size
+    num_patches = source.shape[0]
+    source_grid = source.view(grid_h, grid_w, -1)
+    anchor_grid = anchors.view(2, grid_h, grid_w, -1)
+    best_score = torch.full((grid_h, grid_w), float("-inf"), device=source.device, dtype=torch.float32)
+    best_index = torch.zeros((grid_h, grid_w), device=source.device, dtype=torch.long)
+    base_indices = torch.arange(num_patches, device=source.device, dtype=torch.long).view(grid_h, grid_w)
+    for anchor_idx in range(2):
+        for delta_y in range(-1, 2):
+            for delta_x in range(-1, 2):
+                shifted = torch.roll(anchor_grid[anchor_idx], shifts=(delta_y, delta_x), dims=(0, 1))
+                valid = torch.ones((grid_h, grid_w), dtype=torch.bool, device=source.device)
+                if delta_y > 0:
+                    valid[:delta_y] = False
+                elif delta_y < 0:
+                    valid[delta_y:] = False
+                if delta_x > 0:
+                    valid[:, :delta_x] = False
+                elif delta_x < 0:
+                    valid[:, delta_x:] = False
+                score = (source_grid * shifted).sum(dim=-1).masked_fill(~valid, float("-inf"))
+                replace = score > best_score
+                anchor_y = (torch.arange(grid_h, device=source.device).view(-1, 1) - delta_y) % grid_h
+                anchor_x = (torch.arange(grid_w, device=source.device).view(1, -1) - delta_x) % grid_w
+                candidate = anchor_idx * num_patches + anchor_y * grid_w + anchor_x
+                best_score = torch.where(replace, score, best_score)
+                best_index = torch.where(replace, candidate, best_index)
+    return best_index.reshape(-1)
+
+
+def _aggregate_segment_patch_bank(patch_tokens: torch.Tensor, patch_map: torch.Tensor) -> torch.Tensor:
+    """Average all source patches that share one two-anchor bank slot."""
+    group_size, num_patches, embed_dim = patch_tokens.shape
+    if patch_map.shape != (group_size, num_patches):
+        raise ValueError("Segment patch bank map shape does not match patch tokens")
+    bank_size = 2 * num_patches
+    flat_indices = patch_map.reshape(-1)
+    flat_tokens = patch_tokens.reshape(-1, embed_dim)
+    bank_sum = torch.zeros(bank_size, embed_dim, dtype=torch.float32, device=patch_tokens.device)
+    bank_sum.index_add_(0, flat_indices, flat_tokens.float())
+    counts = torch.zeros(bank_size, dtype=torch.float32, device=patch_tokens.device)
+    counts.index_add_(0, flat_indices, torch.ones_like(flat_indices, dtype=torch.float32))
+    return (bank_sum / counts.clamp_min_(1.0).unsqueeze(-1)).to(patch_tokens.dtype)
+
+
+@dataclass
 class _FrameMergeState:
     def __init__(
         self,
@@ -845,6 +1649,9 @@ class _FrameMergeState:
         merge_group_sizes: list[int] | None = None,
         merge_groups: list[list[int]] | None = None,
         similarity_matrix: torch.Tensor | None = None,
+        anchor_indices: list[int] | None = None,
+        medoid_indices: list[int] | None = None,
+        patch_fusion_ratio: float | None = None,
     ) -> None:
         self.inverse = inverse
         self.active_mask = active_mask
@@ -852,6 +1659,9 @@ class _FrameMergeState:
         self.merge_group_sizes = merge_group_sizes or []
         self.merge_groups = merge_groups or []
         self.similarity_matrix = similarity_matrix
+        self.anchor_indices = anchor_indices or []
+        self.medoid_indices = medoid_indices or []
+        self.patch_fusion_ratio = patch_fusion_ratio
         self.active_frames = int(inverse.max().item()) + 1 if inverse.numel() else 0
 
 
@@ -884,6 +1694,21 @@ def _frame_dynamic_masks(
     return torch.stack(masks, dim=0)
 
 
+def _frame_anchor_masks(
+    state: _FrameMergeState | _BatchFrameMergeState,
+    active_num_frames: int,
+    device: torch.device,
+) -> torch.Tensor:
+    states = state.states if isinstance(state, _BatchFrameMergeState) else [state]
+    masks = []
+    for frame_state in states:
+        mask = torch.zeros(active_num_frames, dtype=torch.bool, device=device)
+        for frame_idx in frame_state.anchor_indices:
+            mask[frame_state.inverse[frame_idx].to(device=device)] = True
+        masks.append(mask)
+    return torch.stack(masks, dim=0)
+
+
 def _dynamic_frame_token_indices(
     dynamic_frame_masks: torch.Tensor,
     num_tokens: int,
@@ -896,6 +1721,20 @@ def _dynamic_frame_token_indices(
         return torch.empty(0, dtype=torch.long, device=device)
     token_offsets = torch.arange(num_tokens, device=device, dtype=torch.long)
     return (dynamic_frames[:, None] * num_tokens + token_offsets[None, :]).flatten()
+
+
+def _anchor_frame_token_indices(
+    anchor_frame_masks: torch.Tensor | None,
+    num_tokens: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if anchor_frame_masks is None or anchor_frame_masks.numel() == 0:
+        return torch.empty(0, dtype=torch.long, device=device)
+    anchors = torch.nonzero(anchor_frame_masks[0].to(device=device), as_tuple=False).flatten()
+    if anchors.numel() == 0:
+        return torch.empty(0, dtype=torch.long, device=device)
+    token_offsets = torch.arange(num_tokens, device=device, dtype=torch.long)
+    return (anchors[:, None] * num_tokens + token_offsets[None, :]).flatten()
 
 
 def _frame_merge_one(
@@ -913,12 +1752,24 @@ def _frame_merge_one(
     group_strategy: str = "local",
     protect_period: int = 0,
     protect_prefix: int = 0,
+    protected_indices: list[int] | None = None,
+    anchor_indices: list[int] | None = None,
 ) -> tuple[torch.Tensor, _FrameMergeState]:
     num_frames = tokens.shape[0]
+    protected_set = {int(frame_idx) for frame_idx in (protected_indices or [])}
+    anchor_indices = sorted({int(frame_idx) for frame_idx in (anchor_indices or [])})
+    if any(frame_idx < 0 or frame_idx >= num_frames for frame_idx in protected_set):
+        raise ValueError("protected frame index is outside the input sequence")
     if num_frames <= 1:
         inverse = torch.arange(num_frames, device=tokens.device)
         active_mask = torch.ones(num_frames, dtype=torch.bool, device=tokens.device)
-        return tokens, _FrameMergeState(inverse, active_mask, [(0, num_frames - 1)], [])
+        return tokens, _FrameMergeState(
+            inverse,
+            active_mask,
+            [(0, num_frames - 1)],
+            [],
+            anchor_indices=anchor_indices,
+        )
 
     patch_tokens = tokens[:, patch_token_start:]
     pooled = _pool_frame_similarity_tokens(patch_tokens, patch_grid_size, pool_stride)
@@ -945,6 +1796,11 @@ def _frame_merge_one(
     assigned = [False] * num_frames
     merge_group_sizes: list[int] = []
     merge_groups: list[list[int]] = []
+
+    def is_protected(frame_idx: int) -> bool:
+        return frame_idx in protected_set or (
+            protect_period > 0 and protect_prefix > 0 and frame_idx % protect_period < protect_prefix
+        )
 
     def append_frame(frame_idx: int) -> None:
         inverse[frame_idx] = len(active_tokens)
@@ -979,7 +1835,7 @@ def _frame_merge_one(
 
     def can_merge_group(start_idx: int, group_size: int) -> bool:
         end_idx = start_idx + group_size - 1
-        if end_idx > end:
+        if end_idx > end or any(is_protected(frame_idx) for frame_idx in range(start_idx, end_idx + 1)):
             return False
         pair_sims = [
             _frame_pair_similarity(pooled[idx], pooled[idx + 1]).float()
@@ -997,13 +1853,30 @@ def _frame_merge_one(
             continue
         append_frame(start)
         if group_strategy == "segment_middle":
-            if end - start > 1:
-                append_group(list(range(start + 1, end)))
+            cursor = start + 1
+            while cursor < end:
+                if is_protected(cursor):
+                    append_frame(cursor)
+                    cursor += 1
+                    continue
+                run_end = cursor
+                while run_end + 1 < end and not is_protected(run_end + 1):
+                    run_end += 1
+                run = list(range(cursor, run_end + 1))
+                if len(run) > 1:
+                    append_group(run)
+                else:
+                    append_frame(cursor)
+                cursor = run_end + 1
             if not assigned[end]:
                 append_frame(end)
             continue
         cursor = start + 1
         while cursor < end:
+            if is_protected(cursor):
+                append_frame(cursor)
+                cursor += 1
+                continue
             group_size = 0
             for candidate_size in range(min(multi_max_group_size, 4), 2, -1):
                 if can_merge_group(cursor, candidate_size):
@@ -1020,7 +1893,7 @@ def _frame_merge_one(
                 if cursor + 1 < end
                 else cur_sim
             )
-            if cur_sim > merge_threshold and cur_sim > next_sim:
+            if not is_protected(cursor + 1) and cur_sim > merge_threshold and cur_sim > next_sim:
                 append_merge(cursor, cursor + 1, cur_sim, next_sim)
                 cursor += 2
             else:
@@ -1030,7 +1903,342 @@ def _frame_merge_one(
             append_frame(end)
 
     merged_tokens = torch.stack(active_tokens, dim=0)
-    return merged_tokens, _FrameMergeState(inverse, active_mask, segments, merge_group_sizes, merge_groups)
+    return merged_tokens, _FrameMergeState(
+        inverse,
+        active_mask,
+        segments,
+        merge_group_sizes,
+        merge_groups,
+        anchor_indices=anchor_indices,
+    )
+
+
+def _frame_anchor_hybrid_merge_one(
+    tokens: torch.Tensor,
+    patch_token_start: int,
+    patch_grid_size: tuple[int, int],
+    alpha: float,
+    segment_threshold: float,
+    merge_threshold: float,
+    max_window: int,
+    pool_stride: int,
+    multi_max_group_size: int,
+    multi_pair_threshold: float,
+    multi_span_threshold: float,
+    group_strategy: str = "local",
+    protect_period: int = 0,
+    protect_prefix: int = 0,
+    *,
+    anchor_count: int,
+    anchor_selection: str,
+) -> tuple[torch.Tensor, _FrameMergeState]:
+    patch_tokens = tokens[:, patch_token_start:]
+    anchors = _select_global_frame_anchors(
+        patch_tokens,
+        patch_grid_size,
+        pool_stride,
+        anchor_count,
+        anchor_selection,
+    )
+    return _frame_merge_one(
+        tokens,
+        patch_token_start,
+        patch_grid_size,
+        alpha,
+        segment_threshold,
+        merge_threshold,
+        max_window,
+        pool_stride,
+        multi_max_group_size,
+        multi_pair_threshold,
+        multi_span_threshold,
+        group_strategy,
+        protect_period,
+        protect_prefix,
+        protected_indices=anchors,
+        anchor_indices=anchors,
+    )
+
+
+def _frame_anchor_adaptive_merge_one(
+    tokens: torch.Tensor,
+    patch_token_start: int,
+    patch_grid_size: tuple[int, int],
+    pool_stride: int,
+    boundary_z: float,
+    medoid_z: float,
+    patch_fusion_quantile: float,
+) -> tuple[torch.Tensor, _FrameMergeState]:
+    """Keep every change-point boundary and merge only representable interior frames.
+
+    The frame partition is based on DINO global and patch-layout distances.  Each
+    interior run is represented by a real medoid frame; only mutually matched,
+    high-confidence patch cells from the remaining members are aggregated into
+    that medoid.  Camera and register tokens are never averaged.
+    """
+    num_frames = tokens.shape[0]
+    if num_frames <= 1:
+        inverse = torch.arange(num_frames, device=tokens.device)
+        return tokens, _FrameMergeState(
+            inverse,
+            torch.ones(num_frames, dtype=torch.bool, device=tokens.device),
+            [(0, max(num_frames - 1, 0))],
+            anchor_indices=list(range(num_frames)),
+        )
+
+    patch_tokens = tokens[:, patch_token_start:]
+    pooled = _pool_frame_similarity_tokens(patch_tokens, patch_grid_size, pool_stride)
+    distances = _adaptive_frame_distance_matrix(pooled)
+    segments = _adaptive_frame_segments(distances, boundary_z)
+    anchors = sorted({frame for start, end in segments for frame in (start, end)})
+
+    active_tokens: list[torch.Tensor] = []
+    inverse = torch.empty(num_frames, dtype=torch.long, device=tokens.device)
+    active_mask = torch.zeros(num_frames, dtype=torch.bool, device=tokens.device)
+    merge_group_sizes: list[int] = []
+    merge_groups: list[list[int]] = []
+    medoid_indices: list[int] = []
+    fused_patch_cells = 0
+    possible_patch_cells = 0
+
+    def append_frame(frame_idx: int) -> None:
+        inverse[frame_idx] = len(active_tokens)
+        active_mask[frame_idx] = True
+        active_tokens.append(tokens[frame_idx])
+
+    def append_group(frame_indices: list[int]) -> None:
+        nonlocal fused_patch_cells, possible_patch_cells
+        medoid_idx = _select_frame_medoid(distances, frame_indices)
+        merged, fused_cells, candidate_cells = _confidence_fuse_medoid_group(
+            tokens,
+            pooled,
+            frame_indices,
+            medoid_idx,
+            patch_token_start,
+            patch_grid_size,
+            pool_stride,
+            patch_fusion_quantile,
+        )
+        active_idx = len(active_tokens)
+        group_indices = torch.tensor(frame_indices, dtype=torch.long, device=tokens.device)
+        inverse[group_indices] = active_idx
+        active_mask[medoid_idx] = True
+        active_tokens.append(merged)
+        merge_group_sizes.append(len(frame_indices))
+        merge_groups.append([int(frame_idx) for frame_idx in frame_indices])
+        medoid_indices.append(int(medoid_idx))
+        fused_patch_cells += fused_cells
+        possible_patch_cells += candidate_cells
+
+    for start, end in segments:
+        append_frame(start)
+        interior = list(range(start + 1, end))
+        if interior:
+            tolerance = _adaptive_medoid_tolerance(distances, start, end, medoid_z)
+            for group in _adaptive_contiguous_medoid_groups(distances, interior, tolerance):
+                if len(group) == 1:
+                    append_frame(group[0])
+                else:
+                    append_group(group)
+        if end != start:
+            append_frame(end)
+
+    patch_fusion_ratio = (
+        float(fused_patch_cells / possible_patch_cells) if possible_patch_cells else 0.0
+    )
+    return torch.stack(active_tokens, dim=0), _FrameMergeState(
+        inverse,
+        active_mask,
+        segments,
+        merge_group_sizes,
+        merge_groups,
+        similarity_matrix=(1.0 - distances).clamp_(0.0, 1.0),
+        anchor_indices=anchors,
+        medoid_indices=medoid_indices,
+        patch_fusion_ratio=patch_fusion_ratio,
+    )
+
+
+def _adaptive_frame_distance_matrix(pooled_tokens: torch.Tensor) -> torch.Tensor:
+    """Distance combines global appearance and spatial patch-layout residuals."""
+    device_type = pooled_tokens.device.type if pooled_tokens.device.type in {"cuda", "cpu"} else "cpu"
+    with torch.autocast(device_type=device_type, enabled=False):
+        patch_features = F.normalize(pooled_tokens.float(), dim=-1)
+        global_features = F.normalize(patch_features.mean(dim=1), dim=-1)
+        layout_features = F.normalize(patch_features.flatten(1), dim=-1)
+        global_distance = 1.0 - global_features @ global_features.transpose(0, 1)
+        layout_distance = 1.0 - layout_features @ layout_features.transpose(0, 1)
+        return (0.5 * global_distance + 0.5 * layout_distance).clamp_min_(0.0)
+
+
+def _robust_location_scale(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    median = values.median()
+    mad = (values - median).abs().median()
+    return median, 1.4826 * mad
+
+
+def _adaptive_frame_segments(distances: torch.Tensor, boundary_z: float) -> list[tuple[int, int]]:
+    num_frames = distances.shape[0]
+    adjacent = distances.diagonal(offset=1)
+    median, scale = _robust_location_scale(adjacent)
+    threshold = median + boundary_z * scale + 1e-5
+    segments: list[tuple[int, int]] = []
+    start = 0
+    for frame_idx, distance in enumerate(adjacent, start=1):
+        if distance > threshold:
+            segments.append((start, frame_idx - 1))
+            start = frame_idx
+    segments.append((start, num_frames - 1))
+    return segments
+
+
+def _adaptive_medoid_tolerance(
+    distances: torch.Tensor,
+    start: int,
+    end: int,
+    medoid_z: float,
+) -> torch.Tensor:
+    adjacent = distances[start:end, start + 1 : end + 1].diagonal()
+    if adjacent.numel() == 0:
+        return distances.new_tensor(0.0)
+    median, scale = _robust_location_scale(adjacent)
+    return median + medoid_z * scale + 1e-5
+
+
+def _select_frame_medoid(distances: torch.Tensor, frame_indices: list[int]) -> int:
+    index = torch.tensor(frame_indices, dtype=torch.long, device=distances.device)
+    costs = distances[index][:, index].mean(dim=1)
+    return int(index[costs.argmin()].item())
+
+
+def _adaptive_contiguous_medoid_groups(
+    distances: torch.Tensor,
+    frame_indices: list[int],
+    tolerance: torch.Tensor,
+) -> list[list[int]]:
+    groups: list[list[int]] = []
+    cursor = 0
+    while cursor < len(frame_indices):
+        best_end = cursor
+        for end in range(cursor, len(frame_indices)):
+            candidate = frame_indices[cursor : end + 1]
+            medoid = _select_frame_medoid(distances, candidate)
+            candidate_index = torch.tensor(candidate, dtype=torch.long, device=distances.device)
+            residual = distances[medoid, candidate_index].max()
+            if end == cursor or residual <= tolerance:
+                best_end = end
+            else:
+                break
+        groups.append(frame_indices[cursor : best_end + 1])
+        cursor = best_end + 1
+    return groups
+
+
+def _confidence_fuse_medoid_group(
+    tokens: torch.Tensor,
+    pooled_tokens: torch.Tensor,
+    frame_indices: list[int],
+    medoid_idx: int,
+    patch_token_start: int,
+    patch_grid_size: tuple[int, int],
+    pool_stride: int,
+    confidence_quantile: float,
+) -> tuple[torch.Tensor, int, int]:
+    """Fuse only mutual pooled-patch correspondences into the medoid view."""
+    merged = tokens[medoid_idx].float().clone()
+    if len(frame_indices) <= 1:
+        return merged.to(tokens.dtype), 0, 0
+
+    grid_h, grid_w = patch_grid_size
+    pooled_h = math.ceil(grid_h / pool_stride)
+    pooled_w = math.ceil(grid_w / pool_stride)
+    num_patches = grid_h * grid_w
+    device = tokens.device
+    target_pooled = F.normalize(pooled_tokens[medoid_idx].float(), dim=-1)
+    correspondences: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    all_confidences: list[torch.Tensor] = []
+    target_cells = torch.arange(pooled_h * pooled_w, device=device)
+
+    for frame_idx in frame_indices:
+        if frame_idx == medoid_idx:
+            continue
+        source_pooled = F.normalize(pooled_tokens[frame_idx].float(), dim=-1)
+        # Quantile-based confidence gating is numerically meaningful only in
+        # FP32; inference otherwise runs under BF16 autocast.
+        similarity = (source_pooled @ target_pooled.transpose(0, 1)).float()
+        source_best_target = similarity.argmax(dim=1)
+        target_best_score, target_best_source = similarity.max(dim=0)
+        mutual = source_best_target[target_best_source] == target_cells
+        if mutual.any():
+            all_confidences.append(target_best_score[mutual])
+        correspondences.append((frame_idx, target_best_source, target_best_score, mutual))
+
+    if not all_confidences:
+        return merged.to(tokens.dtype), 0, 0
+
+    confidence_floor = torch.quantile(torch.cat(all_confidences), confidence_quantile)
+    patch_sum = merged[patch_token_start:].clone()
+    patch_weight = torch.ones(num_patches, 1, device=device, dtype=torch.float32)
+    patch_y = torch.arange(grid_h, device=device).view(-1, 1).expand(grid_h, grid_w).reshape(-1)
+    patch_x = torch.arange(grid_w, device=device).view(1, -1).expand(grid_h, grid_w).reshape(-1)
+    target_cell = (patch_y // pool_stride) * pooled_w + (patch_x // pool_stride)
+    local_y = patch_y % pool_stride
+    local_x = patch_x % pool_stride
+    fused_cells = 0
+
+    for frame_idx, target_best_source, target_best_score, mutual in correspondences:
+        source_cell = target_best_source[target_cell]
+        source_y = (source_cell // pooled_w) * pool_stride + local_y
+        source_x = (source_cell % pooled_w) * pool_stride + local_x
+        valid = (
+            mutual[target_cell]
+            & (target_best_score[target_cell] >= confidence_floor)
+            & (source_y < grid_h)
+            & (source_x < grid_w)
+        )
+        if not valid.any():
+            continue
+        source_flat = source_y * grid_w + source_x
+        confidence = target_best_score[target_cell[valid]].clamp_min(0.0).unsqueeze(-1)
+        source_patch_tokens = tokens[frame_idx, patch_token_start:].float()
+        patch_sum[valid] += confidence * source_patch_tokens[source_flat[valid]]
+        patch_weight[valid] += confidence
+        fused_cells += int(valid.sum().item())
+
+    merged[patch_token_start:] = patch_sum / patch_weight
+    candidate_cells = (len(frame_indices) - 1) * num_patches
+    return merged.to(tokens.dtype), fused_cells, candidate_cells
+
+
+def _select_global_frame_anchors(
+    patch_tokens: torch.Tensor,
+    patch_grid_size: tuple[int, int],
+    pool_stride: int,
+    anchor_count: int,
+    selection: str,
+) -> list[int]:
+    num_frames = patch_tokens.shape[0]
+    count = min(max(anchor_count, 0), num_frames)
+    if count == 0:
+        return []
+    if count == 1:
+        return [0]
+    if selection == "uniform":
+        return list(dict.fromkeys(round(idx * (num_frames - 1) / (count - 1)) for idx in range(count)))
+    if selection != "farthest":
+        raise ValueError(f"Unknown anchor selection {selection!r}")
+
+    pooled = _pool_frame_similarity_tokens(patch_tokens, patch_grid_size, pool_stride)
+    descriptors = F.normalize(pooled.float().mean(dim=1), dim=-1)
+    selected = [0]
+    closest_similarity = descriptors @ descriptors[0]
+    for _ in range(1, count):
+        candidate_scores = 1.0 - closest_similarity
+        candidate_scores[torch.tensor(selected, device=patch_tokens.device)] = -float("inf")
+        candidate = int(candidate_scores.argmax().item())
+        selected.append(candidate)
+        closest_similarity = torch.maximum(closest_similarity, descriptors @ descriptors[candidate])
+    return sorted(selected)
 
 
 def _frame_merge_global_cluster(
@@ -1602,112 +2810,6 @@ def _flashvid_dpc_reduce(
     return reduced, inverse, rope_indices[centers]
 
 
-def _protected_spatial_merge(
-    patch_tokens: torch.Tensor,
-    patch_grid_size: tuple[int, int],
-    retention_ratio: float,
-    protected_fraction: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    num_frames, num_patches, embed_dim = patch_tokens.shape
-    target_per_frame = _target_tokens(num_patches, retention_ratio)
-    protected_per_frame = min(num_patches, max(1, int(round(target_per_frame * protected_fraction))))
-    spatial_budget = max(target_per_frame - protected_per_frame, 1)
-    scores = _token_importance_scores(patch_tokens)
-
-    merged_parts = []
-    inverse_parts = []
-    offset = 0
-    for frame_idx in range(num_frames):
-        frame_tokens = patch_tokens[frame_idx]
-        protected = torch.topk(scores[frame_idx], k=protected_per_frame, largest=True).indices
-        protected_mask = torch.zeros(num_patches, dtype=torch.bool, device=patch_tokens.device)
-        protected_mask[protected] = True
-
-        inverse_frame = torch.empty(num_patches, dtype=torch.long, device=patch_tokens.device)
-        sorted_protected = protected.sort().values
-        inverse_frame[sorted_protected] = torch.arange(sorted_protected.numel(), device=patch_tokens.device)
-        protected_tokens = frame_tokens[sorted_protected]
-
-        unprotected = torch.where(~protected_mask)[0]
-        if unprotected.numel() > 0:
-            keep_h, keep_w = _target_grid_for_budget(*patch_grid_size, spatial_budget)
-            coarse = _coarse_grid_inverse(*patch_grid_size, keep_h, keep_w, patch_tokens.device)[unprotected]
-            unique_coarse, compact = torch.unique(coarse, sorted=True, return_inverse=True)
-            spatial_tokens = _average_by_inverse(frame_tokens[unprotected], compact, unique_coarse.numel())
-            inverse_frame[unprotected] = compact + protected_tokens.shape[0]
-            frame_merged = torch.cat([protected_tokens, spatial_tokens], dim=0)
-        else:
-            frame_merged = protected_tokens
-
-        merged_parts.append(frame_merged)
-        inverse_parts.append(inverse_frame + offset)
-        offset += frame_merged.shape[0]
-
-    return torch.cat(merged_parts, dim=0), torch.cat(inverse_parts, dim=0)
-
-
-def _tstm_merge(
-    patch_tokens: torch.Tensor,
-    patch_grid_size: tuple[int, int],
-    retention_ratio: float,
-    protected_fraction: float,
-    temporal_threshold: float,
-    neighbor_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    num_frames, num_patches, embed_dim = patch_tokens.shape
-    grid_h, grid_w = patch_grid_size
-    target_per_frame = _target_tokens(num_patches, retention_ratio)
-    protected_per_frame = min(num_patches, max(1, int(round(target_per_frame * protected_fraction))))
-    scores = _token_importance_scores(patch_tokens)
-
-    cluster_ids = torch.empty(num_frames, num_patches, dtype=torch.long, device=patch_tokens.device)
-    protected_masks = []
-    for frame_idx in range(num_frames):
-        protected = torch.topk(scores[frame_idx], k=protected_per_frame, largest=True).indices
-        protected_mask = torch.zeros(num_patches, dtype=torch.bool, device=patch_tokens.device)
-        protected_mask[protected] = True
-        protected_masks.append(protected_mask)
-
-    cluster_ids[0] = torch.arange(num_patches, device=patch_tokens.device)
-    next_cluster = num_patches
-    normalized = F.normalize(patch_tokens.float(), dim=-1)
-
-    for frame_idx in range(1, num_frames):
-        if neighbor_size == 0:
-            similarities = normalized[frame_idx] @ normalized[frame_idx - 1].transpose(0, 1)
-            best_sim, best_prev = similarities.max(dim=-1)
-        else:
-            prev_candidates = _local_previous_candidates(normalized[frame_idx - 1], grid_h, grid_w, neighbor_size)
-            current = normalized[frame_idx].view(num_patches, 1, embed_dim)
-            similarities = (current * prev_candidates).sum(dim=-1)
-            best_sim, best_local = similarities.max(dim=-1)
-            local_indices = _local_candidate_indices(grid_h, grid_w, neighbor_size, patch_tokens.device)
-            best_prev = local_indices[torch.arange(num_patches, device=patch_tokens.device), best_local]
-        merge_mask = (
-            (best_sim > temporal_threshold)
-            & ~protected_masks[frame_idx]
-            & ~protected_masks[frame_idx - 1][best_prev]
-        )
-        new_ids = torch.arange(next_cluster, next_cluster + num_patches, device=patch_tokens.device)
-        cluster_ids[frame_idx] = new_ids
-        cluster_ids[frame_idx, merge_mask] = cluster_ids[frame_idx - 1, best_prev[merge_mask]]
-        next_cluster += num_patches
-
-    inverse = cluster_ids.reshape(-1)
-    unique_ids, compact_inverse = torch.unique(inverse, sorted=True, return_inverse=True)
-    merged = _average_by_inverse(patch_tokens.reshape(-1, embed_dim), compact_inverse, unique_ids.numel())
-    target_total = max(1, num_frames * _target_tokens(num_patches, retention_ratio))
-    if merged.shape[0] > target_total:
-        merged, compact_inverse = _coarsen_temporal_clusters(
-            patch_tokens,
-            compact_inverse,
-            merged,
-            patch_grid_size,
-            retention_ratio,
-        )
-    return merged, compact_inverse
-
-
 def _target_tokens(num_tokens: int, retention_ratio: float) -> int:
     return max(1, min(num_tokens, int(round(num_tokens * retention_ratio))))
 
@@ -1744,8 +2846,27 @@ def _parse_layer_ratio_schedule(schedule: str, depth: int) -> dict[int, float]:
     return ratios
 
 
-def _target_grid(grid_h: int, grid_w: int, retention_ratio: float) -> tuple[int, int]:
-    return _target_grid_for_budget(grid_h, grid_w, _target_tokens(grid_h * grid_w, retention_ratio))
+def _parse_block_index_set(value: str, depth: int) -> set[int]:
+    """Parse a comma-separated 0-based block list such as ``0-8,12``."""
+    if not value.strip():
+        return set()
+    blocks: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start_text, end_text = item.split("-", 1)
+            start, end = int(start_text), int(end_text)
+            if start > end:
+                raise ValueError(f"Invalid descending block range {item!r}")
+            blocks.update(range(start, end + 1))
+        else:
+            blocks.add(int(item))
+    invalid = sorted(block for block in blocks if not 0 <= block < depth)
+    if invalid:
+        raise ValueError(f"Skipped attention blocks must be within [0, {depth - 1}], got {invalid}")
+    return blocks
 
 
 def _target_grid_for_budget(grid_h: int, grid_w: int, budget: int) -> tuple[int, int]:
@@ -1810,76 +2931,6 @@ def _feature_merge_frame(
     inverse = torch.argmax(normed_tokens @ normed_centers.transpose(0, 1), dim=-1)
     inverse[centers] = torch.arange(centers.numel(), device=frame_tokens.device)
     return _average_by_inverse(frame_tokens, inverse, centers.numel()), inverse
-
-
-def _token_importance_scores(patch_tokens: torch.Tensor) -> torch.Tensor:
-    scores = patch_tokens.float().norm(dim=-1)
-    if patch_tokens.shape[0] > 1:
-        temporal_change = torch.zeros_like(scores)
-        temporal_change[1:] = (patch_tokens[1:].float() - patch_tokens[:-1].float()).norm(dim=-1)
-        scores = scores + temporal_change
-    return scores
-
-
-def _coarsen_temporal_clusters(
-    patch_tokens: torch.Tensor,
-    inverse: torch.Tensor,
-    merged_tokens: torch.Tensor,
-    patch_grid_size: tuple[int, int],
-    retention_ratio: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    num_frames, num_patches, embed_dim = patch_tokens.shape
-    grid_h, grid_w = patch_grid_size
-    keep_h, keep_w = _target_grid(grid_h, grid_w, retention_ratio)
-    num_clusters = merged_tokens.shape[0]
-    device = patch_tokens.device
-
-    frame_ids = torch.arange(num_frames, device=device).repeat_interleave(num_patches).to(merged_tokens.dtype)
-    patch_ids = torch.arange(num_patches, device=device).repeat(num_frames)
-    y_ids = torch.div(patch_ids, grid_w, rounding_mode="floor").to(merged_tokens.dtype)
-    x_ids = (patch_ids % grid_w).to(merged_tokens.dtype)
-
-    cluster_counts = torch.bincount(inverse, minlength=num_clusters).clamp_min(1).to(merged_tokens.dtype)
-    cluster_frames = torch.zeros(num_clusters, dtype=merged_tokens.dtype, device=device)
-    cluster_y = torch.zeros_like(cluster_frames)
-    cluster_x = torch.zeros_like(cluster_frames)
-    cluster_frames.scatter_add_(0, inverse, frame_ids)
-    cluster_y.scatter_add_(0, inverse, y_ids)
-    cluster_x.scatter_add_(0, inverse, x_ids)
-    cluster_frames = torch.round(cluster_frames / cluster_counts).long().clamp_(0, num_frames - 1)
-    cluster_y = torch.div((cluster_y / cluster_counts).long() * keep_h, grid_h, rounding_mode="floor").clamp_(0, keep_h - 1)
-    cluster_x = torch.div((cluster_x / cluster_counts).long() * keep_w, grid_w, rounding_mode="floor").clamp_(0, keep_w - 1)
-
-    coarse_ids = cluster_frames * (keep_h * keep_w) + cluster_y * keep_w + cluster_x
-    _, cluster_to_coarse = torch.unique(coarse_ids, sorted=True, return_inverse=True)
-    coarsened = _average_by_inverse(merged_tokens, cluster_to_coarse, int(cluster_to_coarse.max().item()) + 1)
-    return coarsened, cluster_to_coarse[inverse]
-
-
-def _local_previous_candidates(
-    prev_tokens: torch.Tensor,
-    grid_h: int,
-    grid_w: int,
-    neighbor_size: int,
-) -> torch.Tensor:
-    embed_dim = prev_tokens.shape[-1]
-    prev_grid = prev_tokens.transpose(0, 1).view(1, embed_dim, grid_h, grid_w)
-    unfolded = F.unfold(prev_grid, kernel_size=neighbor_size, padding=neighbor_size // 2)
-    neighbor_count = neighbor_size * neighbor_size
-    return unfolded.view(embed_dim, neighbor_count, grid_h * grid_w).permute(2, 1, 0)
-
-
-def _local_candidate_indices(
-    grid_h: int,
-    grid_w: int,
-    neighbor_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    index_grid = torch.arange(grid_h * grid_w, device=device, dtype=torch.float32).view(1, 1, grid_h, grid_w)
-    neighbor_count = neighbor_size * neighbor_size
-    unfolded = F.unfold(index_grid, kernel_size=neighbor_size, padding=neighbor_size // 2)
-    unfolded = unfolded.view(neighbor_count, grid_h * grid_w).transpose(0, 1)
-    return unfolded.long().clamp_(0, grid_h * grid_w - 1)
 
 
 def _build_patch_embed(patch_size: int, embed_dim: int) -> DinoVisionTransformer:

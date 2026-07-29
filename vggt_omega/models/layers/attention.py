@@ -86,11 +86,15 @@ class SelfAttention(nn.Module):
         self.fastvggt_special_token_count = None
         self.fastvggt_protected_token_indices = None
         self.fastvggt_dynamic_frame_mask = None
+        # [B, F, P] bool labels used by dynamic-aware FastVGGT merging.
+        self.fastvggt_dynamic_patch_mask = None
         self.last_fastvggt_stats = None
         self.sparse_vggt_config = None
         self.last_sparse_vggt_stats = None
         self.capture_cls_attention = False
         self.last_cls_attention = None
+        self.capture_query_attention_indices = None
+        self.last_query_attention = None
 
     def apply_rope(self, q: Tensor, k: Tensor, rope: Tensor | Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
         # All operations will use the dtype of rope, the output is cast back to the dtype of q and k
@@ -133,7 +137,8 @@ class SelfAttention(nn.Module):
         return uncat_with_shapes(x_flat, shapes, num_tokens)
 
     def compute_attention(self, qkv: Tensor, attn_bias=None, rope=None) -> Tensor:
-        assert attn_bias is None
+        if attn_bias is not None:
+            raise ValueError("SelfAttention does not support an external attention bias")
         B, N, _ = qkv.shape
         C = self.qkv.in_features
 
@@ -149,6 +154,11 @@ class SelfAttention(nn.Module):
             cls_attention = (q[:, :, :1, :] @ k.transpose(-2, -1)) * self.scale
             cls_attention = cls_attention.softmax(dim=-1, dtype=torch.float32).mean(dim=1).squeeze(1)
             self.last_cls_attention = cls_attention.to(q.dtype)
+        if self.capture_query_attention_indices is not None:
+            query_indices = self.capture_query_attention_indices.to(device=q.device, dtype=torch.long)
+            selected_q = q.index_select(2, query_indices)
+            query_attention = (selected_q @ k.transpose(-2, -1)) * self.scale
+            self.last_query_attention = query_attention.softmax(dim=-1, dtype=torch.float32).mean(dim=1)
         unmerge = None
         self.last_fastvggt_stats = None
         self.last_sparse_vggt_stats = None
@@ -169,7 +179,7 @@ class SelfAttention(nn.Module):
             return x
         if self.fastvggt_merge_ratio is not None:
             original_token_count = N
-            merge, unmerge = _fastvggt_token_merge_bipartite2d(
+            merge, unmerge, dynamic_stats = _fastvggt_token_merge_bipartite2d(
                 q.transpose(1, 2).reshape(B, N, C),
                 patch_grid_size=self.fastvggt_patch_grid_size,
                 num_frames=self.fastvggt_num_frames,
@@ -178,6 +188,7 @@ class SelfAttention(nn.Module):
                 protection=self.fastvggt_protection,
                 protected_token_indices=self.fastvggt_protected_token_indices,
                 dynamic_frame_mask=self.fastvggt_dynamic_frame_mask,
+                dynamic_patch_mask=self.fastvggt_dynamic_patch_mask,
             )
             q_merge = q.transpose(1, 2).reshape(B, N, C)
             k_merge = k.transpose(1, 2).reshape(B, N, C)
@@ -189,6 +200,7 @@ class SelfAttention(nn.Module):
                 "active_tokens": int(N),
                 "full_attention_token_ratio": float(N / original_token_count if original_token_count else 0.0),
                 "merged_away_token_ratio": float(1.0 - N / original_token_count if original_token_count else 0.0),
+                **dynamic_stats,
             }
             q = q_merge.reshape(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)
             k = k_merge.reshape(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)
@@ -199,8 +211,6 @@ class SelfAttention(nn.Module):
         if unmerge is not None:
             x = unmerge(x)
         return x
-
-
 def _sparse_vggt_attention_from_qkv(q: Tensor, k: Tensor, v: Tensor, config: dict) -> tuple[Tensor, float]:
     from vggt_omega.models.sparse_vggt_attention import sparse_vggt_attention
 
@@ -255,6 +265,7 @@ def _fastvggt_token_merge_bipartite2d(
     protection: str | None,
     protected_token_indices: Tensor | None = None,
     dynamic_frame_mask: Tensor | None = None,
+    dynamic_patch_mask: Tensor | None = None,
 ):
     B, N, _ = metric.shape
     grid_h, grid_w = patch_grid_size
@@ -264,10 +275,6 @@ def _fastvggt_token_merge_bipartite2d(
             f"Token count {N} does not match frames={num_frames}, "
             f"tokens_per_frame={tokens_per_frame}"
         )
-
-    r = int(N * merge_ratio)
-    if r <= 0:
-        return _merge_do_nothing, _merge_do_nothing
 
     device = metric.device
     gather = torch.gather
@@ -302,6 +309,38 @@ def _fastvggt_token_merge_bipartite2d(
     a_idx = rand_idx[:, num_dst:, :]
     b_idx = rand_idx[:, :num_dst, :]
 
+    dynamic_stats: dict[str, int | float] = {}
+    token_types = None
+    token_type_valid = None
+    if dynamic_patch_mask is not None:
+        expected_shape = (B, num_frames, grid_h * grid_w)
+        if tuple(dynamic_patch_mask.shape) != expected_shape:
+            raise ValueError(
+                "Dynamic FastVGGT patch-mask layout mismatch: "
+                f"got {tuple(dynamic_patch_mask.shape)}, expected {expected_shape}"
+            )
+        token_types = torch.zeros((B, N), device=device, dtype=torch.bool)
+        token_type_valid = torch.zeros((B, N), device=device, dtype=torch.bool)
+        patch_mask = dynamic_patch_mask.to(device=device, dtype=torch.bool)
+        for frame_idx in range(num_frames):
+            patch_start = frame_idx * tokens_per_frame + special_token_count
+            patch_end = patch_start + grid_h * grid_w
+            token_types[:, patch_start:patch_end] = patch_mask[:, frame_idx]
+            token_type_valid[:, patch_start:patch_end] = True
+        dynamic_count = int(patch_mask.sum().item())
+        static_count = int(patch_mask.numel() - dynamic_count)
+        dynamic_stats = {
+            "dynamic_patch_tokens": dynamic_count,
+            "static_patch_tokens": static_count,
+            "dynamic_merged_source_tokens": 0,
+            "static_merged_source_tokens": 0,
+            "cross_type_merged_source_tokens": 0,
+        }
+
+    r = int(N * merge_ratio)
+    if r <= 0:
+        return _merge_do_nothing, _merge_do_nothing, dynamic_stats
+
     num_protected = int(N * 0.1)
     if protection == "decoupled_window":
         protected_indices = _decoupled_window_protected_indices(
@@ -334,17 +373,47 @@ def _fastvggt_token_merge_bipartite2d(
         metric = metric / metric.norm(dim=-1, keepdim=True).clamp_min(1e-6)
         src_metric, dst_metric, _ = split(metric)
         r = min(src_metric.shape[1], r)
-        node_max, node_idx = _fast_similarity_chunks(src_metric, dst_metric.transpose(-1, -2), 5000)
+        if token_types is None:
+            node_max, node_idx = _fast_similarity_chunks(src_metric, dst_metric.transpose(-1, -2), 5000)
+            source_type = None
+        else:
+            source_type = gather(
+                token_types, dim=1, index=a_idx.squeeze(-1).expand(B, a_idx.shape[1])
+            )
+            destination_type = gather(
+                token_types, dim=1, index=b_idx.squeeze(-1).expand(B, b_idx.shape[1])
+            )
+            destination_valid = gather(
+                token_type_valid, dim=1, index=b_idx.squeeze(-1).expand(B, b_idx.shape[1])
+            )
+            node_max, node_idx = _fast_similarity_chunks_type_aware(
+                src_metric,
+                dst_metric.transpose(-1, -2),
+                source_type,
+                destination_type,
+                destination_valid,
+                5000,
+            )
         edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]
 
         src_indices = a_idx[0, :, 0]
         protected_mask_src = torch.isin(src_indices, protected_indices)
         edge_flat = edge_idx[0, :, 0]
         valid_edges = edge_flat[~protected_mask_src[edge_flat]]
+        valid_edges = valid_edges[torch.isfinite(node_max[0, valid_edges])]
         r_actual = min(r, valid_edges.shape[0])
         unm_idx = valid_edges[r_actual:].unsqueeze(0).unsqueeze(-1)
         src_idx = valid_edges[:r_actual].unsqueeze(0).unsqueeze(-1)
         dst_idx = gather(node_idx[..., None], dim=-2, index=src_idx)
+        if source_type is not None:
+            selected_dynamic = source_type[0, src_idx[0, :, 0]]
+            selected_destination_dynamic = destination_type[0, dst_idx[0, :, 0]]
+            cross_type_count = int((selected_dynamic != selected_destination_dynamic).sum().item())
+            if cross_type_count:
+                raise RuntimeError("Dynamic FastVGGT selected a cross-type merge edge")
+            dynamic_stats["dynamic_merged_source_tokens"] = int(selected_dynamic.sum().item())
+            dynamic_stats["static_merged_source_tokens"] = int((~selected_dynamic).sum().item())
+            dynamic_stats["cross_type_merged_source_tokens"] = cross_type_count
 
     def merge(x: Tensor, mode: str = "mean", extra_tensors=None, extra_tensors_2=None):
         src, dst, protected = split(x)
@@ -403,7 +472,7 @@ def _fastvggt_token_merge_bipartite2d(
         out.scatter_(dim=-2, index=protected_idx.expand(B, num_protected_actual, c), src=protected)
         return out
 
-    return merge, unmerge
+    return merge, unmerge, dynamic_stats
 
 
 def _decoupled_window_protected_indices(
@@ -495,6 +564,34 @@ def _fast_similarity_chunks(a: Tensor, b_transposed: Tensor, chunk_size: int):
         chunk_max, chunk_idx = torch.max(scores, dim=2)
         node_max[:, i:end_i] = chunk_max.to(original_dtype)
         node_idx[:, i:end_i] = chunk_idx
+    return node_max, node_idx
+
+
+def _fast_similarity_chunks_type_aware(
+    a: Tensor,
+    b_transposed: Tensor,
+    source_type: Tensor,
+    destination_type: Tensor,
+    destination_valid: Tensor,
+    chunk_size: int,
+) -> tuple[Tensor, Tensor]:
+    """Chunked cosine matching with a hard same-type destination constraint."""
+    batch_size, num_src, _ = a.shape
+    original_dtype = a.dtype
+    a_bf16 = a.to(torch.bfloat16)
+    b_bf16 = b_transposed.to(torch.bfloat16)
+    node_max = torch.empty(batch_size, num_src, device=a.device, dtype=original_dtype)
+    node_idx = torch.empty(batch_size, num_src, device=a.device, dtype=torch.long)
+    for start in range(0, num_src, chunk_size):
+        end = min(start + chunk_size, num_src)
+        scores = torch.bmm(a_bf16[:, start:end, :], b_bf16)
+        compatible = (
+            source_type[:, start:end, None] == destination_type[:, None, :]
+        ) & destination_valid[:, None, :]
+        scores.masked_fill_(~compatible, float("-inf"))
+        chunk_max, chunk_idx = torch.max(scores, dim=2)
+        node_max[:, start:end] = chunk_max.to(original_dtype)
+        node_idx[:, start:end] = chunk_idx
     return node_max, node_idx
 
 

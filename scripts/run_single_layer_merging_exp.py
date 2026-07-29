@@ -6,12 +6,13 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PYTHON = os.environ.get("PYTHON", "/data/mmc_syang/miniconda3/envs/fastvggt/bin/python")
+PYTHON = os.environ.get("PYTHON", sys.executable)
 GPU = os.environ.get("GPU", "5")
 EXP_DIR = Path(os.environ.get("EXP_DIR", ROOT / "layerwise_results" / "exp"))
 DATASET = os.environ.get("DATASET", "tum_dynamic")

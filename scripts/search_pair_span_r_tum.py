@@ -64,8 +64,8 @@ def parse_gpus() -> list[str]:
 
 
 def make_configs() -> list[Config]:
-    pair_values = parse_float_range("PAIR", "0.960", "0.995", "0.001")
-    span_values = parse_float_range("SPAN", "0.920", "0.980", "0.001")
+    pair_values = parse_float_range("PAIR", "0.976", "0.996", "0.001")
+    span_values = parse_float_range("SPAN", "0.938", "0.958", "0.001")
     ratio_values = parse_float_range("R", "0.50", "0.90", "0.01")
     configs = [
         Config(pair=pair, span=span, ratio=ratio)
@@ -77,12 +77,15 @@ def make_configs() -> list[Config]:
     if not configs:
         raise ValueError("No configs after filtering span <= pair")
     if os.environ.get("CENTERED_ORDER", "1") != "0":
+        pair_center = float(os.environ.get("PAIR_CENTER", "0.986"))
+        span_center = float(os.environ.get("SPAN_CENTER", "0.948"))
+        ratio_center = float(os.environ.get("R_CENTER", "0.9"))
         configs.sort(
             key=lambda cfg: (
-                abs(cfg.pair - 0.98) + abs(cfg.span - 0.95) + abs(cfg.ratio - 0.9),
-                abs(cfg.pair - 0.98),
-                abs(cfg.span - 0.95),
-                abs(cfg.ratio - 0.9),
+                abs(cfg.pair - pair_center) + abs(cfg.span - span_center) + abs(cfg.ratio - ratio_center),
+                abs(cfg.pair - pair_center),
+                abs(cfg.span - span_center),
+                abs(cfg.ratio - ratio_center),
             )
         )
     return configs
@@ -169,6 +172,7 @@ def run_config(root: Path, python: str, checkpoint: str, search_dir: Path, gpu: 
             "TRANSFORMERS_CACHE": env.get("TRANSFORMERS_CACHE", str(root / ".cache" / "huggingface" / "hub")),
         }
     )
+    layered_schedule = f"1-10:{cfg.ratio:g},11-18:0.0,19-24:{cfg.ratio:g}"
     cmd = [
         python,
         "inference/infer.py",
@@ -189,6 +193,8 @@ def run_config(root: Path, python: str, checkpoint: str, search_dir: Path, gpu: 
         "frame_persistent_spatial",
         "--token-merging-ratio",
         str(cfg.ratio),
+        "--token-merging-layer-ratios",
+        layered_schedule,
         "--token-merging-start",
         os.environ.get("TOKEN_MERGING_START", "0"),
         "--token-merging-frame-pool-stride",
@@ -222,6 +228,7 @@ def run_config(root: Path, python: str, checkpoint: str, search_dir: Path, gpu: 
         "pair": cfg.pair,
         "span": cfg.span,
         "r": cfg.ratio,
+        "token_merging_layer_ratios": layered_schedule,
         "max_group": int(os.environ.get("MAX_GROUP_SIZE", "4")),
         "restore_layer": int(os.environ.get("RESTORE_LAYER", "24")),
         "gpu": gpu,
@@ -264,11 +271,14 @@ def run_config(root: Path, python: str, checkpoint: str, search_dir: Path, gpu: 
                 ),
             }
         )
+        per_sequence_dir = search_dir / "per_sequence" / cfg.name
+        per_sequence_dir.mkdir(parents=True, exist_ok=True)
+        for filename in ("_sequence_metrics_scale_shift.csv", "_summary_pose_auc.json"):
+            artifact = summary_dir / filename
+            if artifact.exists():
+                shutil.copy2(artifact, per_sequence_dir / filename)
     if os.environ.get("CLEAN_OUTPUTS", "1") != "0":
         shutil.rmtree(output_dir, ignore_errors=True)
-        if proc.returncode == 0 and os.environ.get("KEEP_SUCCESS_LOGS", "0") == "0":
-            log_path.unlink(missing_ok=True)
-            result["log"] = ""
     return result
 
 
@@ -292,6 +302,7 @@ def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
         "pair",
         "span",
         "r",
+        "token_merging_layer_ratios",
         "max_group",
         "restore_layer",
         "abs_rel",
@@ -321,7 +332,9 @@ def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
 def write_summary(path: Path, rows: list[dict[str, object]], configs: list[Config], gpus: list[str]) -> None:
     with path.open("w") as handle:
         handle.write("# TUM pair/span/r search sorted by AUC@3\n\n")
-        handle.write("Fixed settings: `frame_persistent_spatial`, `max_group=4`, `restore_layer=24`, `300` frames.\n\n")
+        handle.write("Fixed settings: `frame_persistent_spatial`, `k0`, `max_group=4`, `restore_layer=24`, `300` frames.\n\n")
+        handle.write("Layer schedule: 0-based blocks `10-17` use `r=0`; all other global blocks use candidate `r`. "
+                     "CLI schedule per row: `1-10:r,11-18:0.0,19-24:r`.\n\n")
         handle.write(f"- finished configs: {len(rows)} / {len(configs)}\n")
         handle.write(f"- gpus: {', '.join(gpus)}\n")
         handle.write(f"- adaptive search: {os.environ.get('ADAPTIVE_SEARCH', '1') != '0'}\n")
@@ -350,8 +363,8 @@ def main() -> int:
     configs = make_configs()
     max_configs = int(os.environ.get("MAX_CONFIGS", str(len(configs))))
     configs = configs[:max_configs]
-    time_budget_hours = float(os.environ.get("TIME_BUDGET_HOURS", "16"))
-    deadline = time.time() + time_budget_hours * 3600
+    time_budget_hours = float(os.environ.get("TIME_BUDGET_HOURS", "0"))
+    deadline = float("inf") if time_budget_hours <= 0 else time.time() + time_budget_hours * 3600
     search_dir_env = os.environ.get("SEARCH_DIR", "")
     search_dir = Path(search_dir_env) if search_dir_env else root / "new_results" / f"tum_pair_span_r_search_{time.strftime('%Y%m%d_%H%M%S')}"
     if not search_dir.is_absolute():
@@ -359,7 +372,12 @@ def main() -> int:
     search_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"search_dir={search_dir}", flush=True)
-    print(f"gpus={','.join(gpus)} configs={len(configs)} time_budget_hours={time_budget_hours}", flush=True)
+    print(
+        f"gpus={','.join(gpus)} configs={len(configs)} "
+        f"time_budget_hours={time_budget_hours or 'unlimited'} "
+        "layered_schedule=1-10:r,11-18:0.0,19-24:r",
+        flush=True,
+    )
 
     valid_keys = {config_key(cfg) for cfg in configs}
     seen: set[tuple[int, int, int]] = set()

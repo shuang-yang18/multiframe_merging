@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-PYTHON="${PYTHON:-/data/mmc_syang/miniconda3/envs/fastvggt/bin/python}"
+PYTHON="${PYTHON:-python}"
 GPU="${GPU:-5}"
 SCHEDULE="${SCHEDULE:-1-10:0.9,11-18:0.3,19-24:0.9}"
 CHECKPOINT="${CHECKPOINT:-checkpoints/vggt_omega_1b_512.pt}"

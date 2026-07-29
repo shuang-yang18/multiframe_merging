@@ -3,9 +3,9 @@ set -euo pipefail
 
 ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 RUN_ROOT="${RUN_ROOT:-outputs/bonn_tum300_accel_20260721}"
-PYTHON="${PYTHON:-/data/mmc_syang/miniconda3/envs/fastvggt/bin/python}"
-BONN_ROOT="${BONN_ROOT:-/data/mmc_syang/dataset/Bonn/rgbd_bonn_dataset}"
-TUM_ROOT="${TUM_ROOT:-/data/mmc_syang/dataset/TUM-Dynamics}"
+PYTHON="${PYTHON:-python}"
+BONN_ROOT="${BONN_ROOT:-datasets/Bonn/rgbd_bonn_dataset}"
+TUM_ROOT="${TUM_ROOT:-datasets/TUM-Dynamics}"
 
 cd "$ROOT"
 export HF_HOME="${HF_HOME:-$ROOT/.cache/huggingface}"

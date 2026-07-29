@@ -169,11 +169,10 @@ def load_model(
     token_merging_ratio: float = 0.9,
     token_merging_layer_ratios: str = "",
     token_merging_method: str = "spatial",
-    token_merging_tstm_threshold: float = 0.8,
-    token_merging_tstm_neighbor_size: int = 3,
     token_merging_flashvid_alpha: float = 0.7,
     token_merging_flashvid_expansion: float = 1.25,
     token_merging_flashvid_pool_stride: int = 2,
+    token_merging_flashvid_tstm_threshold: float = 0.8,
     token_merging_frame_restore_layer: int = 16,
     token_merging_frame_alpha: float = 0.9,
     token_merging_frame_segment_threshold: float = 0.8,
@@ -186,6 +185,16 @@ def load_model(
     token_merging_frame_group_strategy: str = "local",
     token_merging_frame_protect_period: int = 0,
     token_merging_frame_protect_prefix: int = 0,
+    token_merging_frame_anchor_count: int = 4,
+    token_merging_frame_anchor_selection: str = "uniform",
+    token_merging_frame_adaptive_boundary_z: float = 2.5,
+    token_merging_frame_adaptive_medoid_z: float = 1.5,
+    token_merging_frame_patch_fusion_quantile: float = 0.75,
+    token_merging_frame_special_cross_attention: bool = False,
+    token_merging_frame_special_cross_attention_alpha: float = 0.1,
+    token_merging_segment_bank_pair_threshold: float = 0.986,
+    token_merging_segment_bank_span_threshold: float = 0.948,
+    token_merging_segment_bank_max_group_size: int = 4,
     omega_accelerator: str = "none",
     sparse_vggt_sparse_ratio: float | None = 0.5,
     sparse_vggt_cdf_threshold: float | None = None,
@@ -195,11 +204,41 @@ def load_model(
     da_vggt_n_anchors: int = 1,
     da_vggt_dino_batch_size: int = 256,
     da_vggt_lambda_div: float = 0.0,
+    dynamic_fastvggt_schedule: str = "all",
+    skip_global_attention_blocks: str = "",
+    skip_inter_frame_attention_blocks: str = "",
+    frame_only_inter_frame_blocks: str = "",
+    register_only_blocks: str = "",
+    enable_adaptive_frame_token_fusion: bool = False,
+    adaptive_frame_representation: str = "global_pool",
+    adaptive_representation_pca_dim: int = 512,
+    adaptive_representation_clusters: int = 3,
+    adaptive_spatial_grid: int = 4,
+    adaptive_grouping: str = "serial",
+    adaptive_reference_selection: str = "first",
+    adaptive_reference_participates: bool = True,
+    adaptive_group_similarity_threshold: float = 0.98,
+    adaptive_group_max_size: int = 4,
+    adaptive_parallel_window: int = 10,
+    adaptive_update_policy: str = "initial_only",
+    adaptive_update_after_blocks: str = "9,17",
+    adaptive_frame_fusion: str = "direct",
+    adaptive_frame_fusion_weighting: str = "similarity",
+    adaptive_frame_token_similarity_threshold: float = 0.95,
+    adaptive_token_merging: str = "fast_bipartite",
+    adaptive_token_keep_ratio: float = 0.1,
+    adaptive_token_clusters: int = 4,
+    adaptive_token_cluster_budget: str = "proportional",
+    adaptive_token_kmeans_iterations: int = 12,
 ) -> VGGTOmega:
     checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    register_attention_block_indices = register_attention_indices(inter_frame_attention)
+    register_attention_block_indices = (
+        parse_block_indices(register_only_blocks)
+        if register_only_blocks.strip()
+        else register_attention_indices(inter_frame_attention)
+    )
     # Avoid first allocating and initializing another full 1B-parameter copy
     # before assigning tensors from the released checkpoint.
     with torch.device("meta"):
@@ -217,11 +256,10 @@ def load_model(
             token_merging_ratio=token_merging_ratio,
             token_merging_layer_ratios=token_merging_layer_ratios,
             token_merging_method=token_merging_method,
-            token_merging_tstm_threshold=token_merging_tstm_threshold,
-            token_merging_tstm_neighbor_size=token_merging_tstm_neighbor_size,
             token_merging_flashvid_alpha=token_merging_flashvid_alpha,
             token_merging_flashvid_expansion=token_merging_flashvid_expansion,
             token_merging_flashvid_pool_stride=token_merging_flashvid_pool_stride,
+            token_merging_flashvid_tstm_threshold=token_merging_flashvid_tstm_threshold,
             token_merging_frame_restore_layer=token_merging_frame_restore_layer,
             token_merging_frame_alpha=token_merging_frame_alpha,
             token_merging_frame_segment_threshold=token_merging_frame_segment_threshold,
@@ -234,6 +272,16 @@ def load_model(
             token_merging_frame_group_strategy=token_merging_frame_group_strategy,
             token_merging_frame_protect_period=token_merging_frame_protect_period,
             token_merging_frame_protect_prefix=token_merging_frame_protect_prefix,
+            token_merging_frame_anchor_count=token_merging_frame_anchor_count,
+            token_merging_frame_anchor_selection=token_merging_frame_anchor_selection,
+            token_merging_frame_adaptive_boundary_z=token_merging_frame_adaptive_boundary_z,
+            token_merging_frame_adaptive_medoid_z=token_merging_frame_adaptive_medoid_z,
+            token_merging_frame_patch_fusion_quantile=token_merging_frame_patch_fusion_quantile,
+            token_merging_frame_special_cross_attention=token_merging_frame_special_cross_attention,
+            token_merging_frame_special_cross_attention_alpha=token_merging_frame_special_cross_attention_alpha,
+            token_merging_segment_bank_pair_threshold=token_merging_segment_bank_pair_threshold,
+            token_merging_segment_bank_span_threshold=token_merging_segment_bank_span_threshold,
+            token_merging_segment_bank_max_group_size=token_merging_segment_bank_max_group_size,
             omega_accelerator=omega_accelerator,
             sparse_vggt_sparse_ratio=sparse_vggt_sparse_ratio,
             sparse_vggt_cdf_threshold=sparse_vggt_cdf_threshold,
@@ -243,6 +291,31 @@ def load_model(
             da_vggt_n_anchors=da_vggt_n_anchors,
             da_vggt_dino_batch_size=da_vggt_dino_batch_size,
             da_vggt_lambda_div=da_vggt_lambda_div,
+            dynamic_fastvggt_schedule=dynamic_fastvggt_schedule,
+            skip_global_attention_blocks=skip_global_attention_blocks,
+            skip_inter_frame_attention_blocks=skip_inter_frame_attention_blocks,
+            frame_only_inter_frame_blocks=frame_only_inter_frame_blocks,
+            enable_adaptive_frame_token_fusion=enable_adaptive_frame_token_fusion,
+            adaptive_frame_representation=adaptive_frame_representation,
+            adaptive_representation_pca_dim=adaptive_representation_pca_dim,
+            adaptive_representation_clusters=adaptive_representation_clusters,
+            adaptive_spatial_grid=adaptive_spatial_grid,
+            adaptive_grouping=adaptive_grouping,
+            adaptive_reference_selection=adaptive_reference_selection,
+            adaptive_reference_participates=adaptive_reference_participates,
+            adaptive_group_similarity_threshold=adaptive_group_similarity_threshold,
+            adaptive_group_max_size=adaptive_group_max_size,
+            adaptive_parallel_window=adaptive_parallel_window,
+            adaptive_update_policy=adaptive_update_policy,
+            adaptive_update_after_blocks=adaptive_update_after_blocks,
+            adaptive_frame_fusion=adaptive_frame_fusion,
+            adaptive_frame_fusion_weighting=adaptive_frame_fusion_weighting,
+            adaptive_frame_token_similarity_threshold=adaptive_frame_token_similarity_threshold,
+            adaptive_token_merging=adaptive_token_merging,
+            adaptive_token_keep_ratio=adaptive_token_keep_ratio,
+            adaptive_token_clusters=adaptive_token_clusters,
+            adaptive_token_cluster_budget=adaptive_token_cluster_budget,
+            adaptive_token_kmeans_iterations=adaptive_token_kmeans_iterations,
         ).eval()
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if isinstance(state, dict) and "state_dict" in state:
@@ -282,6 +355,27 @@ def register_attention_indices(inter_frame_attention: str) -> list[int] | None:
     )
 
 
+def parse_block_indices(value: str) -> list[int]:
+    """Parse comma-separated 0-based block indices/ranges such as ``1-7,9``."""
+    indices: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start_text, end_text = item.split("-", 1)
+            start, end = int(start_text), int(end_text)
+            if start > end:
+                raise ValueError(f"Invalid descending block range {item!r}")
+            indices.update(range(start, end + 1))
+        else:
+            indices.add(int(item))
+    invalid = sorted(index for index in indices if not 0 <= index < AGGREGATOR_DEPTH)
+    if invalid:
+        raise ValueError(f"register-only block indices must be in [0, {AGGREGATOR_DEPTH - 1}], got {invalid}")
+    return sorted(indices)
+
+
 def windows(paths: Sequence[str], window_size: int) -> Iterable[Sequence[str]]:
     if window_size <= 0 or window_size >= len(paths):
         yield paths
@@ -311,7 +405,10 @@ def infer_sequence(
     all_poses = []
     all_confidences = []
     frame_merge_stats = []
+    frame_special_cross_attention_stats = []
     token_merging_stats = []
+    adaptive_fusion_stats = []
+    segment_patch_bank_stats = []
     sparse_vggt_stats = []
     da_vggt_stats = []
     output_resolution = None
@@ -347,7 +444,10 @@ def infer_sequence(
             else:
                 predictions = model(images, use_amp=use_amp)
         frame_merge_stats.extend(predictions.get("frame_merge_stats", []))
+        frame_special_cross_attention_stats.extend(predictions.get("frame_special_cross_attention_stats", []))
         token_merging_stats.extend(predictions.get("token_merging_stats", []))
+        adaptive_fusion_stats.extend(predictions.get("adaptive_frame_token_fusion_stats", []))
+        segment_patch_bank_stats.extend(predictions.get("segment_patch_bank_stats", []))
         sparse_vggt_stats.extend(predictions.get("sparse_vggt_stats", []))
         if "da_vggt_stats" in predictions:
             da_vggt_stats.append(predictions["da_vggt_stats"])
@@ -405,6 +505,8 @@ def infer_sequence(
         active_means = [float(stat["active_frames_mean"]) for stat in frame_merge_stats]
         retention_ratios = [float(stat["retention_ratio_mean"]) for stat in frame_merge_stats]
         merge_ratios = [float(stat["merge_ratio_mean"]) for stat in frame_merge_stats]
+        anchor_counts = [int(stat.get("anchor_count", 0)) for stat in frame_merge_stats]
+        anchor_selections = [stat.get("anchor_selection") for stat in frame_merge_stats if stat.get("anchor_selection")]
         speed_metrics.update(
             {
                 "frame_merge_events": len(frame_merge_stats),
@@ -414,7 +516,20 @@ def infer_sequence(
                 "frame_merge_active_frames_max": max(int(stat["active_frames_max"]) for stat in frame_merge_stats),
                 "frame_merge_retention_ratio_mean": sum(retention_ratios) / len(retention_ratios),
                 "frame_merge_merge_ratio_mean": sum(merge_ratios) / len(merge_ratios),
+                "frame_merge_anchor_count": int(round(sum(anchor_counts) / len(anchor_counts))),
+                "frame_merge_anchor_selection": anchor_selections[0] if anchor_selections else None,
+                "frame_merge_anchor_frames": frame_merge_stats[0].get("anchor_frames", []),
                 "frame_merge_stats": frame_merge_stats,
+            }
+        )
+    if frame_special_cross_attention_stats:
+        speed_metrics.update(
+            {
+                "frame_special_cross_attention_events": len(frame_special_cross_attention_stats),
+                "frame_special_cross_attention_alpha": float(
+                    frame_special_cross_attention_stats[0]["alpha"]
+                ),
+                "frame_special_cross_attention_stats": frame_special_cross_attention_stats,
             }
         )
     if token_merging_stats:
@@ -429,6 +544,17 @@ def infer_sequence(
             float(stat.get("active_over_frame_original_token_ratio", stat["full_attention_token_ratio"]))
             for stat in token_merging_stats
         ]
+        dynamic_patch_tokens = sum(int(stat.get("dynamic_patch_tokens", 0)) for stat in token_merging_stats)
+        static_patch_tokens = sum(int(stat.get("static_patch_tokens", 0)) for stat in token_merging_stats)
+        dynamic_merged_tokens = sum(
+            int(stat.get("dynamic_merged_source_tokens", 0)) for stat in token_merging_stats
+        )
+        static_merged_tokens = sum(
+            int(stat.get("static_merged_source_tokens", 0)) for stat in token_merging_stats
+        )
+        cross_type_merged_tokens = sum(
+            int(stat.get("cross_type_merged_source_tokens", 0)) for stat in token_merging_stats
+        )
         speed_metrics.update(
             {
                 "token_merging_events": len(token_merging_stats),
@@ -444,7 +570,57 @@ def infer_sequence(
                     active_over_frame_original_ratios
                 )
                 / len(active_over_frame_original_ratios),
+                "dynamic_fastvggt_dynamic_patch_tokens": dynamic_patch_tokens,
+                "dynamic_fastvggt_static_patch_tokens": static_patch_tokens,
+                "dynamic_fastvggt_dynamic_merged_tokens": dynamic_merged_tokens,
+                "dynamic_fastvggt_static_merged_tokens": static_merged_tokens,
+                "dynamic_fastvggt_dynamic_merge_ratio": float(
+                    dynamic_merged_tokens / dynamic_patch_tokens if dynamic_patch_tokens else 0.0
+                ),
+                "dynamic_fastvggt_static_merge_ratio": float(
+                    static_merged_tokens / static_patch_tokens if static_patch_tokens else 0.0
+                ),
+                "dynamic_fastvggt_patch_merge_ratio": float(
+                    (dynamic_merged_tokens + static_merged_tokens)
+                    / (dynamic_patch_tokens + static_patch_tokens)
+                    if dynamic_patch_tokens + static_patch_tokens
+                    else 0.0
+                ),
+                "dynamic_fastvggt_cross_type_merged_tokens": cross_type_merged_tokens,
                 "token_merging_stats": token_merging_stats,
+            }
+        )
+    if adaptive_fusion_stats:
+        adaptive_batches = [batch for stat in adaptive_fusion_stats for batch in stat["batches"]]
+        frame_ratios = [float(batch["frame_merge_ratio"]) for batch in adaptive_batches]
+        frame_token_ratios = [float(batch["frame_fusion_token_ratio"]) for batch in adaptive_batches]
+        token_ratios = [float(batch["token_retention_ratio"]) for batch in adaptive_batches]
+        token_pre_frame_ratios = [
+            float(batch["token_merging_over_pre_frame_token_ratio"]) for batch in adaptive_batches
+        ]
+        active_frames = [float(batch["active_frames"]) for batch in adaptive_batches]
+        speed_metrics.update(
+            {
+                "adaptive_fusion_events": len(adaptive_fusion_stats),
+                "adaptive_fusion_active_frames_mean": sum(active_frames) / len(active_frames),
+                "adaptive_fusion_frame_merge_ratio_mean": sum(frame_ratios) / len(frame_ratios),
+                "adaptive_fusion_frame_token_ratio_mean": sum(frame_token_ratios) / len(frame_token_ratios),
+                "adaptive_fusion_token_retention_ratio_mean": sum(token_ratios) / len(token_ratios),
+                "adaptive_fusion_token_over_frame_fused_token_ratio_mean": sum(token_ratios) / len(token_ratios),
+                "adaptive_fusion_token_over_pre_frame_token_ratio_mean": sum(token_pre_frame_ratios)
+                / len(token_pre_frame_ratios),
+                "adaptive_fusion_stats": adaptive_fusion_stats,
+            }
+        )
+    if segment_patch_bank_stats:
+        compressed_frames = [int(stat["compressed_frames"]) for stat in segment_patch_bank_stats]
+        compressed_segments = [int(stat["compressed_segments"]) for stat in segment_patch_bank_stats]
+        speed_metrics.update(
+            {
+                "segment_patch_bank_events": len(segment_patch_bank_stats),
+                "segment_patch_bank_compressed_frames_mean": sum(compressed_frames) / len(compressed_frames),
+                "segment_patch_bank_compressed_segments_mean": sum(compressed_segments) / len(compressed_segments),
+                "segment_patch_bank_stats": segment_patch_bank_stats,
             }
         )
     if sparse_vggt_stats:

@@ -5,11 +5,11 @@ ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 GPU="${1:?usage: run_bonn_tum300_accel_ablation.sh <gpu>}"
 RUN_ROOT="${RUN_ROOT:-outputs/bonn_tum300_accel_20260721}"
 CHECKPOINT="${CHECKPOINT:-checkpoints/vggt_omega_1b_512.pt}"
-FAST_PYTHON="${FAST_PYTHON:-/data/mmc_syang/miniconda3/envs/fastvggt/bin/python}"
-SPARSE_PYTHON="${SPARSE_PYTHON:-/data/mmc_syang/sparse-vggt/.venv/bin/python}"
-
-BONN_ROOT="${BONN_ROOT:-/data/mmc_syang/dataset/Bonn/rgbd_bonn_dataset}"
-TUM_ROOT="${TUM_ROOT:-/data/mmc_syang/dataset/TUM-Dynamics}"
+SPARSE_REPO="${SPARSE_REPO:-$ROOT/../sparse-vggt}"
+FAST_PYTHON="${FAST_PYTHON:-python}"
+SPARSE_PYTHON="${SPARSE_PYTHON:-$SPARSE_REPO/.venv/bin/python}"
+BONN_ROOT="${BONN_ROOT:-datasets/Bonn/rgbd_bonn_dataset}"
+TUM_ROOT="${TUM_ROOT:-datasets/TUM-Dynamics}"
 OVERWRITE="${OVERWRITE:-0}"
 RUN_EVAL="${RUN_EVAL:-0}"
 
@@ -40,7 +40,7 @@ run_case() {
 
   echo "[$(date '+%F %T')] start dataset=${dataset} method=${method} gpu=${GPU} output=${RUN_ROOT}/${output_name}"
   CUDA_VISIBLE_DEVICES="$GPU" \
-  PYTHONPATH="$ROOT:/data/mmc_syang/sparse-vggt" \
+  PYTHONPATH="$ROOT:$SPARSE_REPO" \
   PYTHONNOUSERSITE=1 \
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   "$python_bin" inference/infer.py \

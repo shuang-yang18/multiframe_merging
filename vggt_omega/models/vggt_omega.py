@@ -31,11 +31,10 @@ class VGGTOmega(nn.Module):
         token_merging_ratio: float = 0.9,
         token_merging_layer_ratios: str = "",
         token_merging_method: str = "spatial",
-        token_merging_tstm_threshold: float = 0.8,
-        token_merging_tstm_neighbor_size: int = 3,
         token_merging_flashvid_alpha: float = 0.7,
         token_merging_flashvid_expansion: float = 1.25,
         token_merging_flashvid_pool_stride: int = 2,
+        token_merging_flashvid_tstm_threshold: float = 0.8,
         token_merging_frame_restore_layer: int = 16,
         token_merging_frame_alpha: float = 0.9,
         token_merging_frame_segment_threshold: float = 0.8,
@@ -48,6 +47,16 @@ class VGGTOmega(nn.Module):
         token_merging_frame_group_strategy: str = "local",
         token_merging_frame_protect_period: int = 0,
         token_merging_frame_protect_prefix: int = 0,
+        token_merging_frame_anchor_count: int = 4,
+        token_merging_frame_anchor_selection: str = "uniform",
+        token_merging_frame_adaptive_boundary_z: float = 2.5,
+        token_merging_frame_adaptive_medoid_z: float = 1.5,
+        token_merging_frame_patch_fusion_quantile: float = 0.75,
+        token_merging_frame_special_cross_attention: bool = False,
+        token_merging_frame_special_cross_attention_alpha: float = 0.1,
+        token_merging_segment_bank_pair_threshold: float = 0.986,
+        token_merging_segment_bank_span_threshold: float = 0.948,
+        token_merging_segment_bank_max_group_size: int = 4,
         omega_accelerator: str = "none",
         sparse_vggt_sparse_ratio: float | None = 0.5,
         sparse_vggt_cdf_threshold: float | None = None,
@@ -57,6 +66,31 @@ class VGGTOmega(nn.Module):
         da_vggt_n_anchors: int = 1,
         da_vggt_dino_batch_size: int = 256,
         da_vggt_lambda_div: float = 0.0,
+        dynamic_fastvggt_schedule: str = "all",
+        skip_global_attention_blocks: str = "",
+        skip_inter_frame_attention_blocks: str = "",
+        frame_only_inter_frame_blocks: str = "",
+        enable_adaptive_frame_token_fusion: bool = False,
+        adaptive_frame_representation: str = "global_pool",
+        adaptive_representation_pca_dim: int = 512,
+        adaptive_representation_clusters: int = 3,
+        adaptive_spatial_grid: int = 4,
+        adaptive_grouping: str = "serial",
+        adaptive_reference_selection: str = "first",
+        adaptive_reference_participates: bool = True,
+        adaptive_group_similarity_threshold: float = 0.98,
+        adaptive_group_max_size: int = 4,
+        adaptive_parallel_window: int = 10,
+        adaptive_update_policy: str = "initial_only",
+        adaptive_update_after_blocks: str = "9,17",
+        adaptive_frame_fusion: str = "direct",
+        adaptive_frame_fusion_weighting: str = "similarity",
+        adaptive_frame_token_similarity_threshold: float = 0.95,
+        adaptive_token_merging: str = "fast_bipartite",
+        adaptive_token_keep_ratio: float = 0.1,
+        adaptive_token_clusters: int = 4,
+        adaptive_token_cluster_budget: str = "proportional",
+        adaptive_token_kmeans_iterations: int = 12,
         **unused_kwargs,
     ) -> None:
         super().__init__()
@@ -78,11 +112,10 @@ class VGGTOmega(nn.Module):
             token_merging_ratio=token_merging_ratio,
             token_merging_layer_ratios=token_merging_layer_ratios,
             token_merging_method=token_merging_method,
-            token_merging_tstm_threshold=token_merging_tstm_threshold,
-            token_merging_tstm_neighbor_size=token_merging_tstm_neighbor_size,
             token_merging_flashvid_alpha=token_merging_flashvid_alpha,
             token_merging_flashvid_expansion=token_merging_flashvid_expansion,
             token_merging_flashvid_pool_stride=token_merging_flashvid_pool_stride,
+            token_merging_flashvid_tstm_threshold=token_merging_flashvid_tstm_threshold,
             token_merging_frame_restore_layer=token_merging_frame_restore_layer,
             token_merging_frame_alpha=token_merging_frame_alpha,
             token_merging_frame_segment_threshold=token_merging_frame_segment_threshold,
@@ -95,6 +128,16 @@ class VGGTOmega(nn.Module):
             token_merging_frame_group_strategy=token_merging_frame_group_strategy,
             token_merging_frame_protect_period=token_merging_frame_protect_period,
             token_merging_frame_protect_prefix=token_merging_frame_protect_prefix,
+            token_merging_frame_anchor_count=token_merging_frame_anchor_count,
+            token_merging_frame_anchor_selection=token_merging_frame_anchor_selection,
+            token_merging_frame_adaptive_boundary_z=token_merging_frame_adaptive_boundary_z,
+            token_merging_frame_adaptive_medoid_z=token_merging_frame_adaptive_medoid_z,
+            token_merging_frame_patch_fusion_quantile=token_merging_frame_patch_fusion_quantile,
+            token_merging_frame_special_cross_attention=token_merging_frame_special_cross_attention,
+            token_merging_frame_special_cross_attention_alpha=token_merging_frame_special_cross_attention_alpha,
+            token_merging_segment_bank_pair_threshold=token_merging_segment_bank_pair_threshold,
+            token_merging_segment_bank_span_threshold=token_merging_segment_bank_span_threshold,
+            token_merging_segment_bank_max_group_size=token_merging_segment_bank_max_group_size,
             enable_sparse_vggt=omega_accelerator == "sparse_vggt",
             sparse_vggt_sparse_ratio=sparse_vggt_sparse_ratio,
             sparse_vggt_cdf_threshold=sparse_vggt_cdf_threshold,
@@ -105,6 +148,31 @@ class VGGTOmega(nn.Module):
             da_vggt_n_anchors=da_vggt_n_anchors,
             da_vggt_dino_batch_size=da_vggt_dino_batch_size,
             da_vggt_lambda_div=da_vggt_lambda_div,
+            dynamic_fastvggt_schedule=dynamic_fastvggt_schedule,
+            skip_global_attention_blocks=skip_global_attention_blocks,
+            skip_inter_frame_attention_blocks=skip_inter_frame_attention_blocks,
+            frame_only_inter_frame_blocks=frame_only_inter_frame_blocks,
+            enable_adaptive_frame_token_fusion=enable_adaptive_frame_token_fusion,
+            adaptive_frame_representation=adaptive_frame_representation,
+            adaptive_representation_pca_dim=adaptive_representation_pca_dim,
+            adaptive_representation_clusters=adaptive_representation_clusters,
+            adaptive_spatial_grid=adaptive_spatial_grid,
+            adaptive_grouping=adaptive_grouping,
+            adaptive_reference_selection=adaptive_reference_selection,
+            adaptive_reference_participates=adaptive_reference_participates,
+            adaptive_group_similarity_threshold=adaptive_group_similarity_threshold,
+            adaptive_group_max_size=adaptive_group_max_size,
+            adaptive_parallel_window=adaptive_parallel_window,
+            adaptive_update_policy=adaptive_update_policy,
+            adaptive_update_after_blocks=adaptive_update_after_blocks,
+            adaptive_frame_fusion=adaptive_frame_fusion,
+            adaptive_frame_fusion_weighting=adaptive_frame_fusion_weighting,
+            adaptive_frame_token_similarity_threshold=adaptive_frame_token_similarity_threshold,
+            adaptive_token_merging=adaptive_token_merging,
+            adaptive_token_keep_ratio=adaptive_token_keep_ratio,
+            adaptive_token_clusters=adaptive_token_clusters,
+            adaptive_token_cluster_budget=adaptive_token_cluster_budget,
+            adaptive_token_kmeans_iterations=adaptive_token_kmeans_iterations,
         )
         _warn_if_rope_not_max(self.aggregator)
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
@@ -160,6 +228,17 @@ class VGGTOmega(nn.Module):
         token_merging_stats = getattr(self.aggregator, "last_token_merging_stats", None)
         if token_merging_stats:
             predictions["token_merging_stats"] = token_merging_stats
+        adaptive_fusion_stats = getattr(self.aggregator, "last_adaptive_frame_token_fusion_stats", None)
+        if adaptive_fusion_stats:
+            predictions["adaptive_frame_token_fusion_stats"] = adaptive_fusion_stats
+        segment_patch_bank_stats = getattr(self.aggregator, "last_segment_patch_bank_stats", None)
+        if segment_patch_bank_stats:
+            predictions["segment_patch_bank_stats"] = segment_patch_bank_stats
+        frame_special_cross_attention_stats = getattr(
+            self.aggregator, "last_frame_special_cross_attention_stats", None
+        )
+        if frame_special_cross_attention_stats:
+            predictions["frame_special_cross_attention_stats"] = frame_special_cross_attention_stats
         if self.aggregator.enable_sparse_vggt:
             sparse_vggt_stats = getattr(self.aggregator, "last_sparse_vggt_stats", None)
             if sparse_vggt_stats:

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 GPU="${GPU:-7}"
 RUN_ROOT="${RUN_ROOT:-outputs/da_fastvggt_tum_bonn300_20260722}"
-PYTHON="${PYTHON:-/data/mmc_syang/miniconda3/envs/fastvggt/bin/python}"
+PYTHON="${PYTHON:-python}"
 CHECKPOINT="${CHECKPOINT:-checkpoints/vggt_omega_1b_512.pt}"
 TUM_ROOT="${TUM_ROOT:-datasets/TUM-Dynamics}"
 BONN_ROOT="${BONN_ROOT:-datasets/Bonn/rgbd_bonn_dataset}"

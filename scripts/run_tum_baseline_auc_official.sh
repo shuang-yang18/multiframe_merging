@@ -6,7 +6,7 @@ GPU="${1:?usage: run_tum_baseline_auc_official.sh <gpu> <max_frames> <output_nam
 MAX_FRAMES="${2:?usage: run_tum_baseline_auc_official.sh <gpu> <max_frames> <output_name>}"
 OUTPUT_NAME="${3:?usage: run_tum_baseline_auc_official.sh <gpu> <max_frames> <output_name>}"
 
-PYTHON="${PYTHON:-/data/mmc_syang/miniconda3/envs/fastvggt/bin/python}"
+PYTHON="${PYTHON:-python}"
 CHECKPOINT="${CHECKPOINT:-checkpoints/vggt_omega_1b_512.pt}"
 TUM_ROOT="${TUM_ROOT:-datasets/TUM-Dynamics}"
 RUN_ROOT="${RUN_ROOT:-auc_eval_results/tum_official_auc}"
