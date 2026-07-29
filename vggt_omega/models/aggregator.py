@@ -624,6 +624,11 @@ class Aggregator(nn.Module):
             if block_idx in self.cached_layer_indices or block_idx == capture_output_block:
                 cache_frame_tokens = frame_tokens
                 cache_tokens = tokens
+                # Adaptive global attention returns the conventional flattened
+                # [B * F, N, C] layout so the next frame block can consume it.
+                # Cached head features, however, always use [B, F, N, C].
+                if cache_tokens.ndim == 3:
+                    cache_tokens = cache_tokens.view(batch_size, num_frames, num_tokens, embed_dim)
                 if frame_merge_state is not None:
                     cache_frame_tokens = _restore_frame_tokens(cache_frame_tokens, frame_merge_state)
                     cache_tokens = _restore_frame_tokens(cache_tokens, frame_merge_state)
