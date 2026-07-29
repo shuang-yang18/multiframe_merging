@@ -78,18 +78,22 @@ def parse_block_list(value: str) -> tuple[int, ...]:
 
 def _pca(features: torch.Tensor, out_dim: int) -> torch.Tensor:
     """PCA projection with deterministic padding for a requested larger width."""
-    features = features.float()
-    if features.numel() == 0:
-        return features.new_zeros((features.shape[0], out_dim))
-    centered = features - features.mean(dim=0, keepdim=True)
-    rank = min(centered.shape[0], centered.shape[1], out_dim)
-    if rank <= 0:
-        return features.new_zeros((features.shape[0], out_dim))
-    _, _, basis = torch.pca_lowrank(centered, q=rank, center=False)
-    projected = centered @ basis[:, :rank]
-    if rank == out_dim:
-        return projected
-    return F.pad(projected, (0, out_dim - rank))
+    # QR, used internally by pca_lowrank, has no CUDA bfloat16 kernel. This
+    # representation is only used for discrete grouping, so keep it in fp32
+    # even when the surrounding VGGT forward pass uses AMP.
+    with torch.autocast(device_type=features.device.type, enabled=False):
+        features = features.to(dtype=torch.float32)
+        if features.numel() == 0:
+            return features.new_zeros((features.shape[0], out_dim))
+        centered = features - features.mean(dim=0, keepdim=True)
+        rank = min(centered.shape[0], centered.shape[1], out_dim)
+        if rank <= 0:
+            return features.new_zeros((features.shape[0], out_dim))
+        _, _, basis = torch.pca_lowrank(centered, q=rank, center=False)
+        projected = centered @ basis[:, :rank]
+        if rank == out_dim:
+            return projected
+        return F.pad(projected, (0, out_dim - rank))
 
 
 def _kmeans(features: torch.Tensor, clusters: int, iterations: int) -> tuple[torch.Tensor, torch.Tensor]:
