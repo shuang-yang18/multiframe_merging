@@ -1,18 +1,18 @@
 # multiframe_merging
 
 This repository contains an accelerated VGGT-Omega variant for long-sequence
-4D reconstruction.  The main idea is to reduce redundant computation inside the
-VGGT-Omega aggregator with two complementary mechanisms:
+4D reconstruction. The primary, reproducible interface is the legacy
+`frame_persistent_spatial` path: persistent multi-frame fusion combined with
+FastVGGT-style spatial token merging inside global attention.
 
-- **Multi-frame merging**: merge visually redundant frames before global
-  inter-frame attention, keep an inverse map, and restore the full frame count
-  at a configurable layer.
+- **Multi-frame merging**: build local groups from frame similarity, merge each
+  group into an active-frame representation, retain an inverse map, and restore
+  the full frame count at a configurable layer.
 - **FastVGGT-style spatial token merging**: at each global inter-frame attention
   layer, merge patch tokens and unmerge them after attention.
 
-The implementation keeps the original VGGT-Omega model interface and adds
-runtime switches for frame merging, global-cluster frame grouping, token merging
-statistics, and frame-group export.
+The implementation keeps the original VGGT-Omega model interface and records
+frame/token retention statistics and concrete merged frame groups.
 
 ## Repository Layout
 
@@ -21,8 +21,6 @@ vggt_omega/models/aggregator.py        # frame merging and aggregator logic
 vggt_omega/models/layers/attention.py  # FastVGGT-style token merge/unmerge
 inference/infer.py                     # TUM / 7scenes / Sintel / Bonn evaluation CLI
 scripts/run_multiframe_merging_eval.sh # main reproducible evaluation entry
-scripts/run_global_cluster_sweep.sh    # global-cluster frame-merging ablation
-scripts/export_frame_merge_groups.py   # export merged frame groups to JSON/CSV
 ```
 
 Generated outputs, checkpoints, and experiment logs are ignored by git.
@@ -70,30 +68,39 @@ run the paper's 10-view setting, sample 10 input frames before inference.
 
 ## Main Method
 
-Run multi-frame merging plus FastVGGT-style spatial token merging:
+The default command reproduces the `Ours: layerwise p=.986/s=.948` setting:
+
+- `frame_persistent_spatial` persistent multi-frame fusion;
+- pair/span thresholds `0.986 / 0.948`, maximum group size `4`;
+- restore all frames only after block `24`;
+- FastVGGT merge-away ratio `r=0.9` on 0-based global blocks `0-9` and
+  `18-23`; blocks `10-17` do not apply token merging.
+
+Run TUM:
 
 ```bash
 GPU=0 \
-RESTORE_LAYER=24 \
-PAIR_THRESHOLD=0.98 \
-SPAN_THRESHOLD=0.95 \
-MAX_GROUP_SIZE=4 \
 scripts/run_multiframe_merging_eval.sh \
   tum_dynamic \
-  tum300_multiframe_max4_pair098_span095_restore24
+  tum300_ours_layerwise_p0986_s0948
 ```
 
-For 7Scenes:
+Run the prepared 7Scenes test split:
 
 ```bash
 GPU=0 \
-RESTORE_LAYER=24 \
-PAIR_THRESHOLD=0.98 \
-SPAN_THRESHOLD=0.95 \
-MAX_GROUP_SIZE=4 \
 scripts/run_multiframe_merging_eval.sh \
   7scenes \
-  7scenes_test300_multiframe_max4_pair098_span095_restore24
+  7scenes_test300_ours_layerwise_p0986_s0948
+```
+
+The script defaults to the settings above. To run an ablation, override only
+the relevant variables, for example:
+
+```bash
+GPU=0 PAIR_THRESHOLD=0.990 SPAN_THRESHOLD=0.960 \
+TOKEN_MERGING_RATIO=0.8 \
+scripts/run_multiframe_merging_eval.sh tum_dynamic tum300_ablation
 ```
 
 Useful environment variables:
@@ -104,49 +111,13 @@ PYTHON               Python executable
 CHECKPOINT           VGGT-Omega checkpoint path
 MAX_FRAMES           frames per sequence, default 300
 TOKEN_MERGING_RATIO  FastVGGT merge-away ratio, default 0.9
+TOKEN_MERGING_LAYER_RATIOS  1-based FastVGGT ratio schedule, default 1-10:0.9,11-18:0.0,19-24:0.9
 RESTORE_LAYER        layer where merged frames are restored
-PAIR_THRESHOLD       adjacent-frame similarity threshold for multi-frame groups
-SPAN_THRESHOLD       first-last similarity threshold for multi-frame groups
+PAIR_THRESHOLD       adjacent-frame similarity threshold, default 0.986
+SPAN_THRESHOLD       first-last similarity threshold, default 0.948
 MAX_GROUP_SIZE       maximum frames per multi-frame group
 MAX_WINDOW           max segment length, default 20
 POOL_STRIDE          pooling stride for frame-similarity descriptors
-```
-
-## Global Cluster Ablation
-
-The global-cluster ablation ignores temporal order and clusters visually similar
-frames subject to a minimum similarity threshold and maximum cluster size:
-
-```bash
-GPU=0 scripts/run_global_cluster_sweep.sh
-```
-
-By default this runs three TUM settings:
-
-```text
-threshold=0.98, max_group_size=4
-threshold=0.95, max_group_size=3
-threshold=0.98, max_group_size=3
-```
-
-Run a single setting:
-
-```bash
-GPU=0 scripts/run_global_cluster_sweep.sh 0.98 3
-```
-
-Each run exports the concrete frame clusters to:
-
-```text
-outputs/<run>/<dataset>/_frame_merge_groups.json
-outputs/<run>/<dataset>/_frame_merge_groups.csv
-```
-
-The CSV contains rows such as:
-
-```text
-sequence,event,block,strategy,batch,group,size,frames
-rgbd_dataset_freiburg3_walking_xyz,0,0,global_cluster,0,12,3,"4 19 82"
 ```
 
 ## Important CLI Options
@@ -168,8 +139,9 @@ python inference/infer.py \
   --token-merging-frame-restore-layer 24 \
   --token-merging-frame-group-strategy local \
   --token-merging-frame-multi-max-group-size 4 \
-  --token-merging-frame-multi-pair-threshold 0.98 \
-  --token-merging-frame-multi-span-threshold 0.95
+  --token-merging-layer-ratios '1-10:0.9,11-18:0.0,19-24:0.9' \
+  --token-merging-frame-multi-pair-threshold 0.986 \
+  --token-merging-frame-multi-span-threshold 0.948
 ```
 
 Frame grouping strategies:

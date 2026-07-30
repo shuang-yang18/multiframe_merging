@@ -1,0 +1,9 @@
+# id	frame_representation	grouping	reference	reference_mode	update_policy	frame_fusion	token_merging
+# Original pairwise_01 branch.
+auc3_p01_initial_uniform	global_pool	serial	first	participates	initial_only	direct_uniform	fast_bipartite
+# Selected update branch of pairwise_01.
+auc3_p01_stage_uniform	global_pool	serial	first	participates	stage_update	direct_uniform	fast_bipartite
+# Original pairwise_12 branch.
+auc3_p12_perlayer_similarity	global_pool	serial	first	participates	per_layer_update	direct_similarity	fast_bipartite
+# Selected fusion branch of pairwise_12.
+auc3_p12_perlayer_uniform	global_pool	serial	first	participates	per_layer_update	direct_uniform	fast_bipartite

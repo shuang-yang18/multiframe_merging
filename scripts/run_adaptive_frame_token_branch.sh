@@ -9,7 +9,7 @@ ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 PYTHON_BIN="${PYTHON_BIN:-/data/mmc_syang/miniconda3/envs/fastvggt/bin/python}"
 RUN_ROOT="${RUN_ROOT:-$ROOT/auc_eval_results/1new}"
 CHECKPOINT="${CHECKPOINT:-$ROOT/checkpoints/vggt_omega_1b_512.pt}"
-MATRIX_FILE="$ROOT/scripts/adaptive_frame_token_pairwise_matrix.tsv"
+MATRIX_FILE="${MATRIX_FILE:-$ROOT/scripts/adaptive_frame_token_pairwise_matrix.tsv}"
 ADAPTIVE_GROUP_SIMILARITY_THRESHOLD="${ADAPTIVE_GROUP_SIMILARITY_THRESHOLD:-0.998}"
 ADAPTIVE_GROUP_MAX_SIZE="${ADAPTIVE_GROUP_MAX_SIZE:-3}"
 ADAPTIVE_FRAME_TOKEN_SIMILARITY_THRESHOLD="${ADAPTIVE_FRAME_TOKEN_SIMILARITY_THRESHOLD:-0.995}"
@@ -52,12 +52,8 @@ COMMON_ADAPTIVE=(
   --adaptive-token-kmeans-iterations 12
 )
 
-if [[ "$METHOD" == pairwise_* ]]; then
-  MATRIX_ROW="$(awk -F $'\t' -v id="$METHOD" '$1 == id { print; exit }' "$MATRIX_FILE")"
-  if [[ -z "$MATRIX_ROW" ]]; then
-    echo "Unknown pairwise matrix method: $METHOD" >&2
-    exit 2
-  fi
+MATRIX_ROW="$(awk -F $'\t' -v id="$METHOD" '$1 == id { print; exit }' "$MATRIX_FILE")"
+if [[ -n "$MATRIX_ROW" ]]; then
   IFS=$'\t' read -r _ FRAME_REPRESENTATION GROUPING REFERENCE REFERENCE_MODE UPDATE_POLICY FRAME_FUSION TOKEN_MERGING <<< "$MATRIX_ROW"
   METHOD_ARGS=(
     "${COMMON_ADAPTIVE[@]}"
@@ -210,7 +206,7 @@ LOG="$METHOD_ROOT/run.log"
 
 # Baselines establish the shared reference first. Branch jobs wait for an
 # explicit release marker so an experiment matrix can be revised safely.
-if [[ "$METHOD" != "baseline_omega_partial" && "$METHOD" != pairwise_* ]]; then
+if [[ "$METHOD" != "baseline_omega_partial" && -z "$MATRIX_ROW" ]]; then
   while [[ ! -f "$RUN_ROOT/.release_branch_jobs" ]]; do
     sleep 30
   done

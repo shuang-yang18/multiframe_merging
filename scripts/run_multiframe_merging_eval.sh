@@ -7,13 +7,15 @@ GPU="${GPU:-0}"
 DATASET="${1:?dataset required: tum_dynamic|7scenes}"
 OUTPUT_NAME="${2:?output name required}"
 
-PAIR_THRESHOLD="${PAIR_THRESHOLD:-0.98}"
-SPAN_THRESHOLD="${SPAN_THRESHOLD:-0.95}"
+PAIR_THRESHOLD="${PAIR_THRESHOLD:-0.986}"
+SPAN_THRESHOLD="${SPAN_THRESHOLD:-0.948}"
 RESTORE_LAYER="${RESTORE_LAYER:-24}"
 TOKEN_MERGING_RATIO="${TOKEN_MERGING_RATIO:-0.9}"
 MAX_GROUP_SIZE="${MAX_GROUP_SIZE:-4}"
 MAX_FRAMES="${MAX_FRAMES:-300}"
 POOL_STRIDE="${POOL_STRIDE:-2}"
+# CLI layers are 1-based: r=0.9 on 0-9 and 18-23, no patch merging on 10-17.
+TOKEN_MERGING_LAYER_RATIOS="${TOKEN_MERGING_LAYER_RATIOS:-1-10:0.9,11-18:0.0,19-24:0.9}"
 
 EXTRA_ARGS=()
 if [[ "$DATASET" == "7scenes" ]]; then
@@ -27,7 +29,7 @@ cd "$ROOT"
 export HF_HOME="${HF_HOME:-$ROOT/.cache/huggingface}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/hub}"
 echo "[$(date '+%F %T')] multiframe_merging dataset=${DATASET} output=${OUTPUT_NAME} gpu=${GPU}"
-echo "  ratio=${TOKEN_MERGING_RATIO} max_group=${MAX_GROUP_SIZE} pair=${PAIR_THRESHOLD} span=${SPAN_THRESHOLD} restore=${RESTORE_LAYER}"
+echo "  ratio=${TOKEN_MERGING_RATIO} layers=${TOKEN_MERGING_LAYER_RATIOS} max_group=${MAX_GROUP_SIZE} pair=${PAIR_THRESHOLD} span=${SPAN_THRESHOLD} restore=${RESTORE_LAYER}"
 
 CUDA_VISIBLE_DEVICES="$GPU" \
 PYTHONPATH="$ROOT" \
@@ -44,6 +46,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --enable-token-merging \
   --token-merging-method frame_persistent_spatial \
   --token-merging-ratio "$TOKEN_MERGING_RATIO" \
+  --token-merging-layer-ratios "$TOKEN_MERGING_LAYER_RATIOS" \
   --token-merging-start 0 \
   --token-merging-frame-pool-stride "$POOL_STRIDE" \
   --token-merging-frame-segment-threshold "${SEGMENT_THRESHOLD:-0.9}" \
