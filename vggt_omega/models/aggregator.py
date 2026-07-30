@@ -16,11 +16,9 @@ from vggt_omega.models.adaptive_frame_token_fusion import (
     AdaptiveFusionConfig,
     build_groups as adaptive_build_groups,
     frame_representations as adaptive_frame_representations,
-    fuse_frames as adaptive_fuse_frames,
-    merge_tokens as adaptive_merge_tokens,
     parse_block_list as adaptive_parse_block_list,
-    restore_frames as adaptive_restore_frames,
-    restore_tokens as adaptive_restore_tokens,
+    restore_selective_frame_token_tokens as adaptive_restore_selective_frame_token_tokens,
+    selective_fuse_and_merge_tokens as adaptive_selective_fuse_and_merge_tokens,
     similarity_matrix as adaptive_similarity_matrix,
 )
 from vggt_omega.models.layers import Mlp, RopePositionEmbedding, SelfAttentionBlock
@@ -710,40 +708,33 @@ class Aggregator(nn.Module):
         layer_groups = []
         for batch_idx in range(batch_size):
             groups, references = cached_groups[batch_idx]
-            frame_state = adaptive_fuse_frames(
+            packed_state = adaptive_selective_fuse_and_merge_tokens(
                 full_tokens[batch_idx],
                 groups,
                 references,
-                config,
-                patch_start=self.patch_token_start,
-            )
-            token_state = adaptive_merge_tokens(
-                frame_state.active_inputs,
                 patch_start=self.patch_token_start,
                 grid_size=patch_grid_size,
                 config=config,
             )
-            compact_output = self.inter_frame_blocks[block_idx](token_state.packed_input.unsqueeze(0), None).squeeze(0)
-            active_output = adaptive_restore_tokens(compact_output, token_state).view(
-                frame_state.active_inputs.shape[0], num_tokens, embed_dim
-            )
-            restored_batches.append(adaptive_restore_frames(active_output, frame_state))
+            compact_output = self.inter_frame_blocks[block_idx](packed_state.packed_input.unsqueeze(0), None).squeeze(0)
+            restored_batches.append(adaptive_restore_selective_frame_token_tokens(compact_output, packed_state))
             layer_groups.append(
                 {
                     "groups": groups,
                     "references": references,
-                    "active_frames": int(frame_state.active_inputs.shape[0]),
+                    "active_frames": int(packed_state.reference_patch_count / max(num_tokens - self.patch_token_start, 1)),
                     "original_frames": int(num_frames),
-                    "frame_merge_ratio": float(1.0 - frame_state.active_inputs.shape[0] / num_frames),
-                    "frame_fusion_token_ratio": float(frame_state.active_inputs.shape[0] / num_frames),
-                    "token_active": int(token_state.selected_count),
-                    "token_original": int(token_state.original_count),
-                    "token_retention_ratio": float(token_state.selected_count / token_state.original_count),
+                    "frame_merge_ratio": float(1.0 - packed_state.frame_input_count / packed_state.original_count),
+                    "frame_fusion_token_ratio": float(packed_state.frame_input_count / packed_state.original_count),
+                    "residual_patch_tokens": int(packed_state.residual_patch_count),
+                    "token_active": int(packed_state.selected_count),
+                    "token_original": int(packed_state.frame_input_count),
+                    "token_retention_ratio": float(packed_state.selected_count / packed_state.frame_input_count),
                     "token_merging_over_frame_fused_token_ratio": float(
-                        token_state.selected_count / token_state.original_count
+                        packed_state.selected_count / packed_state.frame_input_count
                     ),
                     "token_merging_over_pre_frame_token_ratio": float(
-                        token_state.selected_count / (num_frames * num_tokens)
+                        packed_state.selected_count / packed_state.original_count
                     ),
                 }
             )

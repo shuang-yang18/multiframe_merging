@@ -58,6 +58,20 @@ class TokenFusionState:
     original_count: int
 
 
+@dataclass
+class SelectiveFrameTokenState:
+    """Reversible packed layout for selective frame fusion plus token merging."""
+
+    inverse: torch.Tensor
+    packed_input: torch.Tensor
+    original_tokens: torch.Tensor
+    frame_input_count: int
+    reference_patch_count: int
+    residual_patch_count: int
+    selected_count: int
+    original_count: int
+
+
 def parse_block_list(value: str) -> tuple[int, ...]:
     if not value.strip():
         return ()
@@ -467,3 +481,187 @@ def merge_tokens(tokens: torch.Tensor, *, patch_start: int, grid_size: tuple[int
 def restore_tokens(packed_output: torch.Tensor, state: TokenFusionState) -> torch.Tensor:
     centers = state.packed_input[state.inverse]
     return state.original_tokens + (packed_output[state.inverse] - centers)
+
+
+def _fused_reference_patches(
+    tokens: torch.Tensor,
+    members: list[int],
+    reference: int,
+    config: AdaptiveFusionConfig,
+    patch_start: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse only eligible source patches into one reference patch grid.
+
+    The returned boolean mask has one row per source frame.  False entries
+    remain standalone patches and must stay in the global-attention sequence.
+    """
+    reference_patch = tokens[reference, patch_start:].float()
+    sources = [index for index in members if index != reference]
+    if not sources:
+        return reference_patch, torch.empty((0, reference_patch.shape[0]), dtype=torch.bool, device=tokens.device)
+    source_patch = tokens[torch.tensor(sources, device=tokens.device), patch_start:].float()
+    if config.frame_fusion == "direct":
+        if config.frame_fusion_weighting == "uniform":
+            weights = torch.ones(len(sources), dtype=torch.float32, device=tokens.device)
+        else:
+            descriptor = F.normalize(tokens.float().mean(dim=1), dim=-1)
+            weights = (descriptor[sources] @ descriptor[reference]).clamp_min(1e-4)
+        fused = (reference_patch + (source_patch * weights[:, None, None]).sum(dim=0)) / (1.0 + weights.sum())
+        return fused, torch.ones(source_patch.shape[:2], dtype=torch.bool, device=tokens.device)
+    if config.frame_fusion == "token_wise":
+        similarity = F.cosine_similarity(source_patch, reference_patch.unsqueeze(0), dim=-1)
+        selected = similarity >= config.frame_token_similarity_threshold
+        weights = selected.float()
+        source_sum = (source_patch * weights.unsqueeze(-1)).sum(dim=0)
+        source_count = weights.sum(dim=0).clamp_min(1.0).unsqueeze(-1)
+        candidate = (reference_patch + source_sum) / (1.0 + source_count)
+        fused = torch.where(selected.any(dim=0).unsqueeze(-1), candidate, reference_patch)
+        return fused, selected
+    raise ValueError(f"Unknown adaptive frame fusion: {config.frame_fusion}")
+
+
+def _merge_reference_patches(
+    patches: torch.Tensor,
+    grid_size: tuple[int, int],
+    config: AdaptiveFusionConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply the configured token merger to a complete reference patch grid."""
+    patch_count, channels = patches.shape
+    dense = patches.unsqueeze(0)
+    if config.token_merging == "fast_bipartite":
+        selected = _fast_bipartite_selected(dense, grid_size, config.token_keep_ratio)
+        assignments, similarity = _fast_bipartite_assignments(patches, selected, patch_count)
+    elif config.token_merging == "category_topk_norm":
+        selected, labels = _category_selected(dense, config)
+        assignments, similarity = _category_assignments(patches, selected, labels)
+    else:
+        raise ValueError(f"Unknown adaptive token merging: {config.token_merging}")
+    selected_to_packed = torch.full((patch_count,), -1, dtype=torch.long, device=patches.device)
+    selected_to_packed[selected] = torch.arange(selected.numel(), device=patches.device)
+    inverse = selected_to_packed[assignments]
+    weights = ((similarity + 1.0) * 0.5).clamp_min(1e-6)
+    packed_sum = torch.zeros((selected.numel(), channels), dtype=torch.float32, device=patches.device)
+    packed_sum.index_add_(0, inverse, patches.float() * weights.unsqueeze(-1))
+    packed_weight = torch.zeros(selected.numel(), dtype=torch.float32, device=patches.device)
+    packed_weight.index_add_(0, inverse, weights)
+    packed = (packed_sum / packed_weight.clamp_min(1e-6).unsqueeze(-1)).to(patches.dtype)
+    return packed, inverse, selected
+
+
+def selective_fuse_and_merge_tokens(
+    tokens: torch.Tensor,
+    groups: list[list[int]],
+    references: list[int],
+    *,
+    patch_start: int,
+    grid_size: tuple[int, int],
+    config: AdaptiveFusionConfig,
+) -> SelectiveFrameTokenState:
+    """Pack selective frame fusion without dropping per-frame special tokens.
+
+    Camera/register tokens always have an identity mapping.  In token-wise
+    frame fusion, only source patches above the similarity threshold map to a
+    fused reference patch; every remaining source patch stays as its own token
+    through global attention.  Token merging then compresses reference grids
+    only, leaving those residual source patches untouched.
+    """
+    frames, tokens_per_frame, channels = tokens.shape
+    patch_count = tokens_per_frame - patch_start
+    total = frames * tokens_per_frame
+    raw_inverse = torch.empty(total, dtype=torch.long, device=tokens.device)
+
+    # Candidate entries are sorted back into original token order before the
+    # global block, preserving the baseline's frame-major token layout.
+    special_positions = (
+        torch.arange(frames, device=tokens.device)[:, None] * tokens_per_frame
+        + torch.arange(patch_start, device=tokens.device)
+    ).reshape(-1)
+    candidate_features = [tokens[:, :patch_start].reshape(-1, channels)]
+    candidate_positions = [special_positions]
+    raw_inverse[special_positions] = torch.arange(special_positions.numel(), device=tokens.device)
+    candidate_count = int(special_positions.numel())
+    frame_input_count = candidate_count
+    reference_patch_count = 0
+    residual_patch_count = 0
+
+    for group, reference in zip(groups, references):
+        entities: list[tuple[list[int], int]]
+        if config.reference_participates:
+            entities = [(group, reference)]
+        else:
+            others = [index for index in group if index != reference]
+            entities = [([reference], reference)]
+            if others:
+                entities.append((others, others[0]))
+        for members, anchor in entities:
+            fused_patch, fused_sources = _fused_reference_patches(
+                tokens,
+                members,
+                anchor,
+                config,
+                patch_start,
+            )
+            packed_reference, reference_inverse, selected_positions = _merge_reference_patches(
+                fused_patch,
+                grid_size,
+                config,
+            )
+            reference_candidates = candidate_count + torch.arange(
+                packed_reference.shape[0], device=tokens.device
+            )
+            candidate_features.append(packed_reference)
+            candidate_positions.append(anchor * tokens_per_frame + patch_start + selected_positions)
+            reference_mapping = reference_candidates[reference_inverse]
+            anchor_positions = anchor * tokens_per_frame + patch_start + torch.arange(patch_count, device=tokens.device)
+            raw_inverse[anchor_positions] = reference_mapping
+            candidate_count += int(packed_reference.shape[0])
+            frame_input_count += patch_count
+            reference_patch_count += patch_count
+
+            sources = [index for index in members if index != anchor]
+            for source_idx, source in enumerate(sources):
+                source_positions = source * tokens_per_frame + patch_start + torch.arange(
+                    patch_count, device=tokens.device
+                )
+                mapped = fused_sources[source_idx]
+                source_mapping = torch.empty(patch_count, dtype=torch.long, device=tokens.device)
+                source_mapping[mapped] = reference_mapping[mapped]
+                residual = torch.nonzero(~mapped, as_tuple=False).flatten()
+                if residual.numel():
+                    residual_candidates = candidate_count + torch.arange(residual.numel(), device=tokens.device)
+                    candidate_features.append(tokens[source, patch_start:][residual])
+                    candidate_positions.append(source_positions[residual])
+                    source_mapping[residual] = residual_candidates
+                    candidate_count += int(residual.numel())
+                    frame_input_count += int(residual.numel())
+                    residual_patch_count += int(residual.numel())
+                raw_inverse[source_positions] = source_mapping
+
+    positions = torch.cat(candidate_positions)
+    features = torch.cat(candidate_features, dim=0)
+    order = positions.argsort()
+    packed_input = features[order]
+    candidate_to_packed = torch.empty(candidate_count, dtype=torch.long, device=tokens.device)
+    candidate_to_packed[order] = torch.arange(candidate_count, device=tokens.device)
+    inverse = candidate_to_packed[raw_inverse].view(frames, tokens_per_frame)
+    return SelectiveFrameTokenState(
+        inverse=inverse,
+        packed_input=packed_input,
+        original_tokens=tokens,
+        frame_input_count=frame_input_count,
+        reference_patch_count=reference_patch_count,
+        residual_patch_count=residual_patch_count,
+        selected_count=int(packed_input.shape[0]),
+        original_count=total,
+    )
+
+
+def restore_selective_frame_token_tokens(
+    packed_output: torch.Tensor,
+    state: SelectiveFrameTokenState,
+) -> torch.Tensor:
+    """Restore original token slots from a selective packed global output."""
+    flat_original = state.original_tokens.reshape(-1, state.original_tokens.shape[-1])
+    centers = state.packed_input[state.inverse.reshape(-1)]
+    restored = flat_original + (packed_output[state.inverse.reshape(-1)] - centers)
+    return restored.view_as(state.original_tokens)

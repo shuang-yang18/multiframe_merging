@@ -293,6 +293,10 @@ def evaluate_dataset(args: argparse.Namespace, dataset: str) -> dict:
     output_root = Path(args.output_dir) / dataset
     output_root.mkdir(parents=True, exist_ok=True)
     sequence_rows = []
+    # The input value is already a sequence-level mean. Aggregate sequences
+    # uniformly so long sequences or high-resolution frames do not dominate it.
+    final_token_over_initial_token_ratios = []
+    frame_token_ratios = []
 
     for seq in sequences:
         bonn_manifest = None
@@ -342,6 +346,12 @@ def evaluate_dataset(args: argparse.Namespace, dataset: str) -> dict:
             )
         with (pred_root / seq / "_time.json").open() as handle:
             timing = json.load(handle)
+        final_token_ratio = timing.get("adaptive_fusion_token_over_pre_frame_token_ratio_mean")
+        if isinstance(final_token_ratio, (int, float)) and np.isfinite(final_token_ratio):
+            final_token_over_initial_token_ratios.append(float(final_token_ratio))
+        frame_token_ratio = timing.get("adaptive_fusion_frame_token_ratio_mean")
+        if isinstance(frame_token_ratio, (int, float)) and np.isfinite(frame_token_ratio):
+            frame_token_ratios.append(float(frame_token_ratio))
         width, height = timing["resolution"]
         gt_frames = [preprocess_depth(dataset, image, depth, (width, height)) for image, depth in zip(images, gt_paths)]
         pred = np.stack([resize_prediction_to_gt(np.load(path), gt) for path, gt in zip(pred_paths, gt_frames)])
@@ -492,6 +502,18 @@ def evaluate_dataset(args: argparse.Namespace, dataset: str) -> dict:
     if token_merging_pool_strides:
         summary["token_merging_flashvid_pool_stride"] = ",".join(token_merging_pool_strides)
     summary["valid_pixels"] = int(weights.sum())
+    summary["adaptive_fusion_final_token_over_initial_token_ratio_sequence_mean"] = (
+        float(np.mean(final_token_over_initial_token_ratios))
+        if final_token_over_initial_token_ratios
+        else None
+    )
+    summary["adaptive_fusion_final_token_over_initial_token_ratio_sequence_count"] = len(
+        final_token_over_initial_token_ratios
+    )
+    summary["adaptive_fusion_frame_token_ratio_sequence_mean"] = (
+        float(np.mean(frame_token_ratios)) if frame_token_ratios else None
+    )
+    summary["adaptive_fusion_frame_token_ratio_sequence_count"] = len(frame_token_ratios)
     write_csv(output_root / f"_summary_{args.align}.csv", [summary])
     write_json(output_root / f"_summary_{args.align}.json", summary)
     pose_rows = []
@@ -561,6 +583,18 @@ def evaluate_dataset(args: argparse.Namespace, dataset: str) -> dict:
         ),
         "token_merging_full_attention_token_ratio_mean": summary.get(
             "token_merging_full_attention_token_ratio_mean"
+        ),
+        "adaptive_fusion_final_token_over_initial_token_ratio_sequence_mean": summary.get(
+            "adaptive_fusion_final_token_over_initial_token_ratio_sequence_mean"
+        ),
+        "adaptive_fusion_final_token_over_initial_token_ratio_sequence_count": summary.get(
+            "adaptive_fusion_final_token_over_initial_token_ratio_sequence_count"
+        ),
+        "adaptive_fusion_frame_token_ratio_sequence_mean": summary.get(
+            "adaptive_fusion_frame_token_ratio_sequence_mean"
+        ),
+        "adaptive_fusion_frame_token_ratio_sequence_count": summary.get(
+            "adaptive_fusion_frame_token_ratio_sequence_count"
         ),
     }}
     write_json(output_root / f"_summary_complete_{args.align}.json", complete)

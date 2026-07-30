@@ -10,6 +10,10 @@ PYTHON_BIN="${PYTHON_BIN:-/data/mmc_syang/miniconda3/envs/fastvggt/bin/python}"
 RUN_ROOT="${RUN_ROOT:-$ROOT/auc_eval_results/1new}"
 CHECKPOINT="${CHECKPOINT:-$ROOT/checkpoints/vggt_omega_1b_512.pt}"
 MATRIX_FILE="$ROOT/scripts/adaptive_frame_token_pairwise_matrix.tsv"
+ADAPTIVE_GROUP_SIMILARITY_THRESHOLD="${ADAPTIVE_GROUP_SIMILARITY_THRESHOLD:-0.998}"
+ADAPTIVE_GROUP_MAX_SIZE="${ADAPTIVE_GROUP_MAX_SIZE:-3}"
+ADAPTIVE_FRAME_TOKEN_SIMILARITY_THRESHOLD="${ADAPTIVE_FRAME_TOKEN_SIMILARITY_THRESHOLD:-0.995}"
+ADAPTIVE_TOKEN_KEEP_RATIO="${ADAPTIVE_TOKEN_KEEP_RATIO:-0.4}"
 
 case "$DATASET" in
   tum)
@@ -38,12 +42,12 @@ COMMON_ADAPTIVE=(
   --adaptive-representation-pca-dim 128
   --adaptive-representation-clusters 3
   --adaptive-spatial-grid 4
-  --adaptive-group-similarity-threshold 0.98
-  --adaptive-group-max-size 4
+  --adaptive-group-similarity-threshold "$ADAPTIVE_GROUP_SIMILARITY_THRESHOLD"
+  --adaptive-group-max-size "$ADAPTIVE_GROUP_MAX_SIZE"
   --adaptive-parallel-window 10
   --adaptive-update-after-blocks 9,17
-  --adaptive-frame-token-similarity-threshold 0.95
-  --adaptive-token-keep-ratio 0.1
+  --adaptive-frame-token-similarity-threshold "$ADAPTIVE_FRAME_TOKEN_SIMILARITY_THRESHOLD"
+  --adaptive-token-keep-ratio "$ADAPTIVE_TOKEN_KEEP_RATIO"
   --adaptive-token-clusters 4
   --adaptive-token-kmeans-iterations 12
 )
@@ -246,6 +250,22 @@ for artifact in \
     cp "$artifact" "$SUMMARY_DIR/$(basename "$artifact")"
   fi
 done
+
+# Keep sequence-level evaluation evidence even though dense prediction arrays
+# and previews under _work are disposable.  This preserves per-sequence pose
+# AUC and inference timing for later analysis.
+SEQUENCE_WORK_ROOT="$WORK_DIR/$DATASET_NAME"
+SEQUENCE_SUMMARY_ROOT="$SUMMARY_DIR/sequences"
+if [[ -d "$SEQUENCE_WORK_ROOT" ]]; then
+  while IFS= read -r -d '' artifact; do
+    relative_path="${artifact#"$SEQUENCE_WORK_ROOT/"}"
+    destination="$SEQUENCE_SUMMARY_ROOT/$relative_path"
+    mkdir -p "$(dirname "$destination")"
+    cp "$artifact" "$destination"
+  done < <(
+    find "$SEQUENCE_WORK_ROOT" -type f \( -name '_pose_auc.json' -o -name '_time.json' \) -print0
+  )
+fi
 
 rm -rf "$WORK_DIR"
 touch "$METHOD_ROOT/.done"
