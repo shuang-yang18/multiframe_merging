@@ -173,6 +173,11 @@ def load_model(
     token_merging_flashvid_expansion: float = 1.25,
     token_merging_flashvid_pool_stride: int = 2,
     token_merging_flashvid_tstm_threshold: float = 0.8,
+    token_merging_fastvggt_destination_selector: str = "random",
+    token_merging_fastvggt_destination_policy: str = "grid_2x2",
+    token_merging_fastvggt_uniform_protect_ratio: float = 0.0,
+    token_merging_fastvggt_exclusive_protection: bool = True,
+    token_merging_fastvggt_protect_anchor_frames: bool = True,
     token_merging_frame_restore_layer: int = 16,
     token_merging_frame_alpha: float = 0.9,
     token_merging_frame_segment_threshold: float = 0.8,
@@ -182,6 +187,11 @@ def load_model(
     token_merging_frame_multi_max_group_size: int = 2,
     token_merging_frame_multi_pair_threshold: float = 0.95,
     token_merging_frame_multi_span_threshold: float = 0.93,
+    token_merging_frame_upper_adaptive: bool = False,
+    token_merging_frame_staged_ranges: str = "0-9,10-17,18-23",
+    token_merging_frame_staged_late_segment_threshold: float | None = None,
+    token_merging_frame_staged_late_pair_threshold: float | None = None,
+    token_merging_frame_staged_late_span_threshold: float | None = None,
     token_merging_frame_group_strategy: str = "local",
     token_merging_frame_protect_period: int = 0,
     token_merging_frame_protect_prefix: int = 0,
@@ -204,6 +214,10 @@ def load_model(
     da_vggt_n_anchors: int = 1,
     da_vggt_dino_batch_size: int = 256,
     da_vggt_lambda_div: float = 0.0,
+    da_chunk_strided_groups: int = 5,
+    da_chunk_strided_anchor_count: int = 5,
+    shared_anchor_num_chunks: int = 10,
+    shared_anchor_count: int = 10,
     dynamic_fastvggt_schedule: str = "all",
     skip_global_attention_blocks: str = "",
     skip_inter_frame_attention_blocks: str = "",
@@ -260,6 +274,11 @@ def load_model(
             token_merging_flashvid_expansion=token_merging_flashvid_expansion,
             token_merging_flashvid_pool_stride=token_merging_flashvid_pool_stride,
             token_merging_flashvid_tstm_threshold=token_merging_flashvid_tstm_threshold,
+            token_merging_fastvggt_destination_selector=token_merging_fastvggt_destination_selector,
+            token_merging_fastvggt_destination_policy=token_merging_fastvggt_destination_policy,
+            token_merging_fastvggt_uniform_protect_ratio=token_merging_fastvggt_uniform_protect_ratio,
+            token_merging_fastvggt_exclusive_protection=token_merging_fastvggt_exclusive_protection,
+            token_merging_fastvggt_protect_anchor_frames=token_merging_fastvggt_protect_anchor_frames,
             token_merging_frame_restore_layer=token_merging_frame_restore_layer,
             token_merging_frame_alpha=token_merging_frame_alpha,
             token_merging_frame_segment_threshold=token_merging_frame_segment_threshold,
@@ -269,6 +288,11 @@ def load_model(
             token_merging_frame_multi_max_group_size=token_merging_frame_multi_max_group_size,
             token_merging_frame_multi_pair_threshold=token_merging_frame_multi_pair_threshold,
             token_merging_frame_multi_span_threshold=token_merging_frame_multi_span_threshold,
+            token_merging_frame_upper_adaptive=token_merging_frame_upper_adaptive,
+            token_merging_frame_staged_ranges=token_merging_frame_staged_ranges,
+            token_merging_frame_staged_late_segment_threshold=token_merging_frame_staged_late_segment_threshold,
+            token_merging_frame_staged_late_pair_threshold=token_merging_frame_staged_late_pair_threshold,
+            token_merging_frame_staged_late_span_threshold=token_merging_frame_staged_late_span_threshold,
             token_merging_frame_group_strategy=token_merging_frame_group_strategy,
             token_merging_frame_protect_period=token_merging_frame_protect_period,
             token_merging_frame_protect_prefix=token_merging_frame_protect_prefix,
@@ -291,6 +315,10 @@ def load_model(
             da_vggt_n_anchors=da_vggt_n_anchors,
             da_vggt_dino_batch_size=da_vggt_dino_batch_size,
             da_vggt_lambda_div=da_vggt_lambda_div,
+            da_chunk_strided_groups=da_chunk_strided_groups,
+            da_chunk_strided_anchor_count=da_chunk_strided_anchor_count,
+            shared_anchor_num_chunks=shared_anchor_num_chunks,
+            shared_anchor_count=shared_anchor_count,
             dynamic_fastvggt_schedule=dynamic_fastvggt_schedule,
             skip_global_attention_blocks=skip_global_attention_blocks,
             skip_inter_frame_attention_blocks=skip_inter_frame_attention_blocks,
@@ -411,6 +439,8 @@ def infer_sequence(
     segment_patch_bank_stats = []
     sparse_vggt_stats = []
     da_vggt_stats = []
+    da_chunk_strided_shared_anchor_stats = []
+    shared_anchor_chunk_stats = []
     output_resolution = None
     elapsed = 0.0
     if device.type == "cuda":
@@ -451,6 +481,10 @@ def infer_sequence(
         sparse_vggt_stats.extend(predictions.get("sparse_vggt_stats", []))
         if "da_vggt_stats" in predictions:
             da_vggt_stats.append(predictions["da_vggt_stats"])
+        if "da_chunk_strided_shared_anchor_stats" in predictions:
+            da_chunk_strided_shared_anchor_stats.append(predictions["da_chunk_strided_shared_anchor_stats"])
+        if "shared_anchor_chunk_stats" in predictions:
+            shared_anchor_chunk_stats.append(predictions["shared_anchor_chunk_stats"])
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         elapsed += time.perf_counter() - start
@@ -505,8 +539,34 @@ def infer_sequence(
         active_means = [float(stat["active_frames_mean"]) for stat in frame_merge_stats]
         retention_ratios = [float(stat["retention_ratio_mean"]) for stat in frame_merge_stats]
         merge_ratios = [float(stat["merge_ratio_mean"]) for stat in frame_merge_stats]
+        raw_merge_ratios = [
+            float(stat["raw_merge_ratio_mean"])
+            for stat in frame_merge_stats
+            if stat.get("raw_merge_ratio_mean") is not None
+        ]
+        policies = [stat.get("adaptive_policy") for stat in frame_merge_stats if stat.get("adaptive_policy")]
+        selected_pair_thresholds = [
+            float(stat["selected_pair_threshold_mean"])
+            for stat in frame_merge_stats
+            if stat.get("selected_pair_threshold_mean") is not None
+        ]
+        selected_span_thresholds = [
+            float(stat["selected_span_threshold_mean"])
+            for stat in frame_merge_stats
+            if stat.get("selected_span_threshold_mean") is not None
+        ]
         anchor_counts = [int(stat.get("anchor_count", 0)) for stat in frame_merge_stats]
         anchor_selections = [stat.get("anchor_selection") for stat in frame_merge_stats if stat.get("anchor_selection")]
+        frame_fusion_cuda_ms = [
+            float(stat["frame_fusion_cuda_ms"])
+            for stat in frame_merge_stats
+            if stat.get("frame_fusion_cuda_ms") is not None
+        ]
+        frame_fusion_host_wall_ms = [
+            float(stat["frame_fusion_host_wall_ms"])
+            for stat in frame_merge_stats
+            if stat.get("frame_fusion_host_wall_ms") is not None
+        ]
         speed_metrics.update(
             {
                 "frame_merge_events": len(frame_merge_stats),
@@ -516,9 +576,31 @@ def infer_sequence(
                 "frame_merge_active_frames_max": max(int(stat["active_frames_max"]) for stat in frame_merge_stats),
                 "frame_merge_retention_ratio_mean": sum(retention_ratios) / len(retention_ratios),
                 "frame_merge_merge_ratio_mean": sum(merge_ratios) / len(merge_ratios),
+                "frame_merge_raw_merge_ratio_mean": sum(raw_merge_ratios) / len(raw_merge_ratios)
+                if raw_merge_ratios
+                else None,
+                "frame_merge_adaptive_policy": policies[0] if len(set(policies)) == 1 else None,
+                "frame_merge_selected_pair_threshold_mean": sum(selected_pair_thresholds)
+                / len(selected_pair_thresholds)
+                if selected_pair_thresholds
+                else None,
+                "frame_merge_selected_span_threshold_mean": sum(selected_span_thresholds)
+                / len(selected_span_thresholds)
+                if selected_span_thresholds
+                else None,
                 "frame_merge_anchor_count": int(round(sum(anchor_counts) / len(anchor_counts))),
                 "frame_merge_anchor_selection": anchor_selections[0] if anchor_selections else None,
                 "frame_merge_anchor_frames": frame_merge_stats[0].get("anchor_frames", []),
+                "frame_fusion_cuda_ms_mean": sum(frame_fusion_cuda_ms) / len(frame_fusion_cuda_ms)
+                if frame_fusion_cuda_ms
+                else None,
+                "frame_fusion_cuda_ms_total": sum(frame_fusion_cuda_ms) if frame_fusion_cuda_ms else None,
+                "frame_fusion_host_wall_ms_mean": sum(frame_fusion_host_wall_ms) / len(frame_fusion_host_wall_ms)
+                if frame_fusion_host_wall_ms
+                else None,
+                "frame_fusion_host_wall_ms_total": sum(frame_fusion_host_wall_ms)
+                if frame_fusion_host_wall_ms
+                else None,
                 "frame_merge_stats": frame_merge_stats,
             }
         )
@@ -644,6 +726,36 @@ def infer_sequence(
                 "da_vggt_chunk_size": da_vggt_stats[0].get("da_vggt_chunk_size"),
                 "da_vggt_sampling_method": da_vggt_stats[0].get("da_vggt_sampling_method"),
                 "da_vggt_stats": da_vggt_stats,
+            }
+        )
+    if da_chunk_strided_shared_anchor_stats:
+        speed_metrics.update(
+            {
+                "da_chunk_strided_shared_anchor_events": len(da_chunk_strided_shared_anchor_stats),
+                "da_chunk_strided_outer_chunk_count_mean": sum(
+                    float(stat["outer_chunk_count"]) for stat in da_chunk_strided_shared_anchor_stats
+                )
+                / len(da_chunk_strided_shared_anchor_stats),
+                "da_chunk_strided_group_count": da_chunk_strided_shared_anchor_stats[0].get("group_count"),
+                "da_chunk_strided_group_sizes": da_chunk_strided_shared_anchor_stats[0].get("group_sizes"),
+                "da_chunk_strided_global_anchor_count": da_chunk_strided_shared_anchor_stats[0].get(
+                    "global_anchor_count"
+                ),
+                "da_chunk_strided_shared_anchor_stats": da_chunk_strided_shared_anchor_stats,
+            }
+        )
+    if shared_anchor_chunk_stats:
+        speed_metrics.update(
+            {
+                "shared_anchor_chunk_events": len(shared_anchor_chunk_stats),
+                "shared_anchor_num_chunks_mean": sum(
+                    float(stat["shared_anchor_num_chunks"]) for stat in shared_anchor_chunk_stats
+                )
+                / len(shared_anchor_chunk_stats),
+                "shared_anchor_chunk_size": shared_anchor_chunk_stats[0].get("shared_anchor_chunk_size"),
+                "shared_anchor_count": shared_anchor_chunk_stats[0].get("shared_anchor_count"),
+                "shared_anchor_selection": shared_anchor_chunk_stats[0].get("shared_anchor_selection"),
+                "shared_anchor_chunk_stats": shared_anchor_chunk_stats,
             }
         )
     return elapsed, depths, poses, confidences, output_resolution, speed_metrics

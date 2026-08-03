@@ -24,7 +24,6 @@ run_case() {
     --dataset sintel \
     --dataset-root "$SINTEL_ROOT" \
     --window-size 0 \
-    --frame-sample-mode first \
     --checkpoint "$ROOT/checkpoints/vggt_omega_1b_512.pt" \
     --output-dir "$RUN_ROOT/$name" \
     --eval \

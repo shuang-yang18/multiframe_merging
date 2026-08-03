@@ -35,6 +35,11 @@ class VGGTOmega(nn.Module):
         token_merging_flashvid_expansion: float = 1.25,
         token_merging_flashvid_pool_stride: int = 2,
         token_merging_flashvid_tstm_threshold: float = 0.8,
+        token_merging_fastvggt_destination_selector: str = "random",
+        token_merging_fastvggt_destination_policy: str = "grid_2x2",
+        token_merging_fastvggt_uniform_protect_ratio: float = 0.0,
+        token_merging_fastvggt_exclusive_protection: bool = True,
+        token_merging_fastvggt_protect_anchor_frames: bool = True,
         token_merging_frame_restore_layer: int = 16,
         token_merging_frame_alpha: float = 0.9,
         token_merging_frame_segment_threshold: float = 0.8,
@@ -44,6 +49,11 @@ class VGGTOmega(nn.Module):
         token_merging_frame_multi_max_group_size: int = 2,
         token_merging_frame_multi_pair_threshold: float = 0.95,
         token_merging_frame_multi_span_threshold: float = 0.93,
+        token_merging_frame_upper_adaptive: bool = False,
+        token_merging_frame_staged_ranges: str = "0-9,10-17,18-23",
+        token_merging_frame_staged_late_segment_threshold: float | None = None,
+        token_merging_frame_staged_late_pair_threshold: float | None = None,
+        token_merging_frame_staged_late_span_threshold: float | None = None,
         token_merging_frame_group_strategy: str = "local",
         token_merging_frame_protect_period: int = 0,
         token_merging_frame_protect_prefix: int = 0,
@@ -66,6 +76,10 @@ class VGGTOmega(nn.Module):
         da_vggt_n_anchors: int = 1,
         da_vggt_dino_batch_size: int = 256,
         da_vggt_lambda_div: float = 0.0,
+        da_chunk_strided_groups: int = 5,
+        da_chunk_strided_anchor_count: int = 5,
+        shared_anchor_num_chunks: int = 10,
+        shared_anchor_count: int = 10,
         dynamic_fastvggt_schedule: str = "all",
         skip_global_attention_blocks: str = "",
         skip_inter_frame_attention_blocks: str = "",
@@ -94,14 +108,35 @@ class VGGTOmega(nn.Module):
         **unused_kwargs,
     ) -> None:
         super().__init__()
-        if omega_accelerator not in {"none", "da_vggt", "sparse_vggt"}:
-            raise ValueError("omega_accelerator must be 'none', 'da_vggt', or 'sparse_vggt'")
+        if omega_accelerator not in {
+            "none",
+            "da_vggt",
+            "sparse_vggt",
+            "shared_anchor_chunks",
+            "da_chunk_strided_shared_anchor",
+        }:
+            raise ValueError(
+                "omega_accelerator must be 'none', 'da_vggt', 'sparse_vggt', "
+                "'shared_anchor_chunks', or 'da_chunk_strided_shared_anchor'"
+            )
+        if shared_anchor_num_chunks < 1:
+            raise ValueError("shared_anchor_num_chunks must be positive.")
+        if shared_anchor_count < 1:
+            raise ValueError("shared_anchor_count must be positive.")
+        if da_chunk_strided_groups < 1:
+            raise ValueError("da_chunk_strided_groups must be positive.")
+        if da_chunk_strided_anchor_count < 1:
+            raise ValueError("da_chunk_strided_anchor_count must be positive.")
         if unused_kwargs:
             warnings.warn(
                 f"Ignoring unsupported VGGTOmega options: {sorted(unused_kwargs)}",
                 stacklevel=2,
             )
         self.omega_accelerator = omega_accelerator
+        self.da_chunk_strided_groups = da_chunk_strided_groups
+        self.da_chunk_strided_anchor_count = da_chunk_strided_anchor_count
+        self.shared_anchor_num_chunks = shared_anchor_num_chunks
+        self.shared_anchor_count = shared_anchor_count
 
         self.aggregator = Aggregator(
             patch_size=patch_size,
@@ -116,6 +151,11 @@ class VGGTOmega(nn.Module):
             token_merging_flashvid_expansion=token_merging_flashvid_expansion,
             token_merging_flashvid_pool_stride=token_merging_flashvid_pool_stride,
             token_merging_flashvid_tstm_threshold=token_merging_flashvid_tstm_threshold,
+            token_merging_fastvggt_destination_selector=token_merging_fastvggt_destination_selector,
+            token_merging_fastvggt_destination_policy=token_merging_fastvggt_destination_policy,
+            token_merging_fastvggt_uniform_protect_ratio=token_merging_fastvggt_uniform_protect_ratio,
+            token_merging_fastvggt_exclusive_protection=token_merging_fastvggt_exclusive_protection,
+            token_merging_fastvggt_protect_anchor_frames=token_merging_fastvggt_protect_anchor_frames,
             token_merging_frame_restore_layer=token_merging_frame_restore_layer,
             token_merging_frame_alpha=token_merging_frame_alpha,
             token_merging_frame_segment_threshold=token_merging_frame_segment_threshold,
@@ -125,6 +165,11 @@ class VGGTOmega(nn.Module):
             token_merging_frame_multi_max_group_size=token_merging_frame_multi_max_group_size,
             token_merging_frame_multi_pair_threshold=token_merging_frame_multi_pair_threshold,
             token_merging_frame_multi_span_threshold=token_merging_frame_multi_span_threshold,
+            token_merging_frame_upper_adaptive=token_merging_frame_upper_adaptive,
+            token_merging_frame_staged_ranges=token_merging_frame_staged_ranges,
+            token_merging_frame_staged_late_segment_threshold=token_merging_frame_staged_late_segment_threshold,
+            token_merging_frame_staged_late_pair_threshold=token_merging_frame_staged_late_pair_threshold,
+            token_merging_frame_staged_late_span_threshold=token_merging_frame_staged_late_span_threshold,
             token_merging_frame_group_strategy=token_merging_frame_group_strategy,
             token_merging_frame_protect_period=token_merging_frame_protect_period,
             token_merging_frame_protect_prefix=token_merging_frame_protect_prefix,
@@ -142,7 +187,11 @@ class VGGTOmega(nn.Module):
             sparse_vggt_sparse_ratio=sparse_vggt_sparse_ratio,
             sparse_vggt_cdf_threshold=sparse_vggt_cdf_threshold,
             sparse_vggt_pool_mode=sparse_vggt_pool_mode,
-            enable_da_vggt=omega_accelerator == "da_vggt",
+            enable_da_vggt=omega_accelerator in {
+                "da_vggt",
+                "shared_anchor_chunks",
+                "da_chunk_strided_shared_anchor",
+            },
             da_vggt_max_frames=da_vggt_max_frames,
             da_vggt_sampling_method=da_vggt_sampling_method,
             da_vggt_n_anchors=da_vggt_n_anchors,
@@ -186,6 +235,13 @@ class VGGTOmega(nn.Module):
         if self.omega_accelerator == "da_vggt" and self.aggregator.da_vggt_max_frames > 0:
             if images.shape[1] > self.aggregator.da_vggt_max_frames:
                 return self._forward_da_vggt(images, use_amp=use_amp)
+        if self.omega_accelerator == "shared_anchor_chunks" and images.shape[1] > 1:
+            return self._forward_shared_anchor_chunks(images, use_amp=use_amp)
+        if (
+            self.omega_accelerator == "da_chunk_strided_shared_anchor"
+            and images.shape[1] > self.aggregator.da_vggt_max_frames > 0
+        ):
+            return self._forward_da_chunk_strided_shared_anchor(images, use_amp=use_amp)
 
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp and images.is_cuda):
@@ -248,7 +304,71 @@ class VGGTOmega(nn.Module):
             predictions["images"] = images
         return predictions
 
-    def _forward_da_vggt(self, images: torch.Tensor, use_amp: bool = True) -> dict[str, torch.Tensor]:
+    def _forward_shared_anchor_chunks(self, images: torch.Tensor, use_amp: bool = True) -> dict[str, torch.Tensor]:
+        """Run strided chunks with locally representative shared anchor frames."""
+
+        num_frames = images.shape[1]
+        if self.shared_anchor_count >= num_frames:
+            raise ValueError("shared_anchor_count must be smaller than the input frame count.")
+        predictions = self._forward_da_vggt(
+            images,
+            use_amp=use_amp,
+            stats_key="shared_anchor_chunk_stats",
+            timing_prefix="shared_anchor",
+            chunk_factory=lambda pooled_tokens: _shared_anchor_make_chunks(
+                pooled_tokens,
+                self.shared_anchor_num_chunks,
+                self.shared_anchor_count,
+            ),
+            sampling_method="local_window_medoid_strided",
+        )
+        predictions["shared_anchor_chunk_stats"]["shared_anchor_num_requested_chunks"] = self.shared_anchor_num_chunks
+        predictions["shared_anchor_chunk_stats"]["shared_anchor_selection"] = "local_window_medoid"
+        return predictions
+
+    def _forward_da_chunk_strided_shared_anchor(
+        self, images: torch.Tensor, use_amp: bool = True
+    ) -> dict[str, torch.Tensor]:
+        """Run balanced groups formed by striding inside DA similarity chunks."""
+
+        metadata: dict[str, int | str | list[int]] = {}
+
+        def make_chunks(pooled_tokens: torch.Tensor) -> tuple[list[list[int]], list[int]]:
+            chunks, anchors, chunk_metadata = _da_chunk_strided_shared_anchor_make_chunks(
+                pooled_tokens,
+                outer_chunk_size=self.aggregator.da_vggt_max_frames,
+                outer_sampling_method=self.aggregator.da_vggt_sampling_method,
+                lambda_div=self.aggregator.da_vggt_lambda_div,
+                num_groups=self.da_chunk_strided_groups,
+                n_anchors=self.da_chunk_strided_anchor_count,
+            )
+            metadata.update(chunk_metadata)
+            return chunks, anchors
+
+        predictions = self._forward_da_vggt(
+            images,
+            use_amp=use_amp,
+            stats_key="da_chunk_strided_shared_anchor_stats",
+            timing_prefix="da_chunk_strided_shared_anchor",
+            chunk_factory=make_chunks,
+            sampling_method=f"{self.aggregator.da_vggt_sampling_method}_chunk_strided_shared_anchor",
+        )
+        predictions["da_chunk_strided_shared_anchor_stats"].update(metadata)
+        return predictions
+
+    def _forward_da_vggt(
+        self,
+        images: torch.Tensor,
+        use_amp: bool = True,
+        *,
+        chunks: list[list[int]] | None = None,
+        anchors: list[int] | None = None,
+        stats_key: str = "da_vggt_stats",
+        timing_prefix: str = "da_vggt",
+        chunk_size: int | None = None,
+        sampling_method: str | None = None,
+        chunk_factory=None,
+    ) -> dict[str, torch.Tensor]:
         import time
 
         batch_size, num_frames, _, height, width = images.shape
@@ -259,7 +379,7 @@ class VGGTOmega(nn.Module):
 
         device = images.device
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        timing = {"accelerator": "da_vggt"}
+        timing = {"accelerator": self.omega_accelerator}
         self.aggregator.last_frame_merge_stats = []
         self.aggregator.last_token_merging_stats = []
         self.aggregator.last_sparse_vggt_stats = []
@@ -271,20 +391,31 @@ class VGGTOmega(nn.Module):
             patch_tokens_cpu, pooled_tokens = self.aggregator.forward_dino(images)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
-        timing["da_vggt_dino"] = time.perf_counter() - start
+        timing[f"{timing_prefix}_dino"] = time.perf_counter() - start
 
-        start = time.perf_counter()
-        chunks, anchors = _da_vggt_make_chunks(
-            pooled_tokens,
-            self.aggregator.da_vggt_max_frames,
-            self.aggregator.da_vggt_sampling_method,
-            self.aggregator.da_vggt_n_anchors,
-            self.aggregator.da_vggt_lambda_div,
-        )
-        timing["da_vggt_sampling"] = time.perf_counter() - start
-        timing["da_vggt_num_chunks"] = len(chunks)
-        timing["da_vggt_chunk_size"] = self.aggregator.da_vggt_max_frames
-        timing["da_vggt_sampling_method"] = self.aggregator.da_vggt_sampling_method
+        if chunk_factory is not None:
+            start = time.perf_counter()
+            chunks, anchors = chunk_factory(pooled_tokens)
+            timing[f"{timing_prefix}_sampling"] = time.perf_counter() - start
+        elif chunks is None or anchors is None:
+            start = time.perf_counter()
+            chunks, anchors = _da_vggt_make_chunks(
+                pooled_tokens,
+                self.aggregator.da_vggt_max_frames,
+                self.aggregator.da_vggt_sampling_method,
+                self.aggregator.da_vggt_n_anchors,
+                self.aggregator.da_vggt_lambda_div,
+            )
+            timing[f"{timing_prefix}_sampling"] = time.perf_counter() - start
+            chunk_size = self.aggregator.da_vggt_max_frames
+            sampling_method = self.aggregator.da_vggt_sampling_method
+        if chunks is None or anchors is None:
+            raise RuntimeError("Chunked inference requires both chunks and anchors.")
+        if chunk_size is None:
+            chunk_size = max(len(chunk) for chunk in chunks)
+        timing[f"{timing_prefix}_num_chunks"] = len(chunks)
+        timing[f"{timing_prefix}_chunk_size"] = chunk_size
+        timing[f"{timing_prefix}_sampling_method"] = sampling_method
 
         chunk_pose_encs = []
         chunk_frame_indices = []
@@ -300,6 +431,11 @@ class VGGTOmega(nn.Module):
             start_chunk = time.perf_counter()
             index = torch.tensor(chunk_indices, dtype=torch.long)
             patch_tokens = patch_tokens_cpu[index].to(device, non_blocking=True)
+            anchor_frame_masks = torch.tensor(
+                [[frame_idx in set(anchors) for frame_idx in chunk_indices]],
+                dtype=torch.bool,
+                device=device,
+            )
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp and images.is_cuda):
                 aggregated_tokens_list, patch_token_start = self.aggregator.forward_transformer(
                     patch_tokens,
@@ -308,6 +444,7 @@ class VGGTOmega(nn.Module):
                     height=height,
                     width=width,
                     device=device,
+                    anchor_frame_masks=anchor_frame_masks,
                 )
             with torch.autocast(device_type="cuda", enabled=False):
                 pose_enc = self.camera_head(aggregated_tokens_list, patch_token_start=patch_token_start)
@@ -327,13 +464,13 @@ class VGGTOmega(nn.Module):
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize(device)
             chunk_times.append(time.perf_counter() - start_chunk)
-        timing["da_vggt_transformer_total"] = time.perf_counter() - start_all_chunks
-        timing["da_vggt_transformer_per_chunk"] = chunk_times
+        timing[f"{timing_prefix}_transformer_total"] = time.perf_counter() - start_all_chunks
+        timing[f"{timing_prefix}_transformer_per_chunk"] = chunk_times
 
         pose_enc = _da_vggt_align_poses(chunk_pose_encs, chunk_frame_indices, anchors, num_frames, device)
         predictions = {
             "pose_enc": pose_enc.unsqueeze(0),
-            "da_vggt_stats": {
+            stats_key: {
                 **timing,
                 "chunk_frame_indices": chunk_frame_indices,
                 "anchors": anchors,
@@ -357,7 +494,7 @@ class VGGTOmega(nn.Module):
             )
             predictions["depth"] = depth.unsqueeze(0)
             predictions["depth_conf"] = depth_conf.unsqueeze(0)
-            predictions["da_vggt_stats"]["depth_chunk_scales"] = depth_scales
+            predictions[stats_key]["depth_chunk_scales"] = depth_scales
 
         if not self.training:
             predictions["images"] = images
@@ -502,6 +639,106 @@ def _da_vggt_make_chunks(
     sim = (feats @ feats.T).numpy()
     chunks, anchors = _da_vggt_fl_maxmin_split(sim, chunk_size, lambda_div, n_anchors)
     return chunks, anchors
+
+
+def _shared_anchor_make_chunks(
+    pooled_tokens: torch.Tensor,
+    num_chunks: int,
+    n_anchors: int,
+) -> tuple[list[list[int]], list[int]]:
+    """Choose a local medoid per temporal window, then interleave non-anchor frames."""
+    if num_chunks < 1:
+        raise ValueError("shared_anchor_num_chunks must be positive.")
+    num_frames = pooled_tokens.shape[0]
+    if n_anchors < 1 or n_anchors >= num_frames:
+        raise ValueError("shared_anchor_count must be in [1, num_frames).")
+    anchors = _select_global_window_medoids(pooled_tokens, n_anchors)
+    anchor_set = set(anchors)
+    non_anchor_frames = [frame_idx for frame_idx in range(num_frames) if frame_idx not in anchor_set]
+    effective_chunks = min(num_chunks, len(non_anchor_frames))
+    chunks: list[list[int]] = []
+    for chunk_idx in range(effective_chunks):
+        local_frames = non_anchor_frames[chunk_idx::effective_chunks]
+        chunks.append(_da_vggt_insert_anchors(local_frames, anchors))
+    return chunks, anchors
+
+
+def _select_global_window_medoids(pooled_tokens: torch.Tensor, n_anchors: int) -> list[int]:
+    """Select frame 0 plus one pooled-feature medoid from each later time window."""
+    num_frames = pooled_tokens.shape[0]
+    if n_anchors < 1 or n_anchors >= num_frames:
+        raise ValueError("Anchor count must be in [1, num_frames).")
+    num_windows = n_anchors - 1
+    anchors = [0]
+    if not num_windows:
+        return anchors
+    features = F.normalize(pooled_tokens.float(), dim=-1)
+    for window_idx in range(num_windows):
+        start = 1 + window_idx * (num_frames - 1) // num_windows
+        end = 1 + (window_idx + 1) * (num_frames - 1) // num_windows
+        window_indices = torch.arange(start, end, device=features.device)
+        window_features = features[window_indices]
+        if len(window_indices) == 1:
+            anchors.append(int(window_indices[0]))
+            continue
+        similarity = window_features @ window_features.T
+        mean_similarity = (similarity.sum(dim=1) - 1.0) / (len(window_indices) - 1)
+        anchors.append(int(window_indices[mean_similarity.argmax()]))
+    return anchors
+
+
+def _da_chunk_strided_shared_anchor_make_chunks(
+    pooled_tokens: torch.Tensor,
+    *,
+    outer_chunk_size: int,
+    outer_sampling_method: str,
+    lambda_div: float,
+    num_groups: int,
+    n_anchors: int,
+) -> tuple[list[list[int]], list[int], dict[str, int | str | list[int]]]:
+    """Build fixed-count balanced groups by interleaving frames inside DA chunks."""
+    if outer_chunk_size <= 0:
+        raise ValueError("da_vggt_max_frames must be positive for chunk-strided grouping.")
+    if num_groups < 1:
+        raise ValueError("num_groups must be positive.")
+
+    anchors = _select_global_window_medoids(pooled_tokens, n_anchors)
+    anchor_set = set(anchors)
+    outer_chunks, _ = _da_vggt_make_chunks(
+        pooled_tokens,
+        outer_chunk_size,
+        outer_sampling_method,
+        n_anchors=1,
+        lambda_div=lambda_div,
+    )
+
+    groups: list[list[int]] = [[] for _ in range(num_groups)]
+    covered: list[int] = []
+    for outer_chunk in outer_chunks:
+        frames = sorted(frame_idx for frame_idx in outer_chunk if frame_idx not in anchor_set)
+        # Preserve local interleaving while rotating slots to balance final groups.
+        start = min(range(num_groups), key=lambda group_idx: (len(groups[group_idx]), group_idx))
+        for local_idx, frame_idx in enumerate(frames):
+            groups[(start + local_idx) % num_groups].append(frame_idx)
+            covered.append(frame_idx)
+
+    expected = [frame_idx for frame_idx in range(pooled_tokens.shape[0]) if frame_idx not in anchor_set]
+    if sorted(covered) != expected:
+        raise RuntimeError("DA chunk-strided grouping must cover every non-anchor frame exactly once.")
+    if max(map(len, groups)) - min(map(len, groups)) > 1:
+        raise RuntimeError("DA chunk-strided grouping produced imbalanced final groups.")
+
+    chunks = [_da_vggt_insert_anchors(sorted(group), anchors) for group in groups if group]
+    metadata: dict[str, int | str | list[int]] = {
+        "outer_chunk_count": len(outer_chunks),
+        "outer_chunk_size": outer_chunk_size,
+        "outer_sampling_method": outer_sampling_method,
+        "group_count": len(chunks),
+        "group_sizes": [len(chunk) for chunk in chunks],
+        "global_anchor_count": len(anchors),
+        "global_anchor_selection": "frame0_plus_window_medoids",
+    }
+    return chunks, anchors, metadata
 
 
 def _da_vggt_step_sampling_split(num_frames: int, chunk_size: int, n_anchors: int) -> tuple[list[list[int]], list[int]]:

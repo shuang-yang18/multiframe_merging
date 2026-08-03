@@ -22,9 +22,6 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --bonn-depth-dir depth \
   --bonn-association-max-diff 0.02 \
   --max-frames-per-seq 10 \
-  --frame-sample-mode random \
-  --frame-sample-seed 0 \
-  --frame-sample-random-order \
   --window-size 0 \
   --checkpoint checkpoints/vggt_omega_1b_512.pt \
   --output-dir "$RUN_ROOT" \

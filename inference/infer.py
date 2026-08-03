@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 from pathlib import Path
 
@@ -136,6 +135,11 @@ def parse_args() -> argparse.Namespace:
             "frame_temporary",
             "frame_persistent",
             "frame_persistent_spatial",
+            "frame_persistent_adaptive",
+            "frame_persistent_adaptive_spatial",
+            "frame_temporary_adaptive_spatial",
+            "frame_staged_adaptive_spatial",
+            "token_only_adaptive_spatial",
             "frame_persistent_decoupled",
             "frame_persistent_decoupled_window",
             "frame_anchor_hybrid",
@@ -219,6 +223,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--token-merging-flashvid-expansion", type=float, default=1.25)
     parser.add_argument("--token-merging-flashvid-pool-stride", type=int, default=2)
     parser.add_argument("--token-merging-flashvid-tstm-threshold", type=float, default=0.8)
+    parser.add_argument(
+        "--token-merging-fastvggt-destination-selector",
+        choices=["random", "local_medoid"],
+        default="random",
+        help=(
+            "Choose 2x2 FastVGGT destination patches by fixed random sampling or "
+            "local Q-feature medoids with value-norm tie breaking."
+        ),
+    )
+    parser.add_argument(
+        "--token-merging-fastvggt-destination-policy",
+        choices=["grid_2x2", "global_25pct"],
+        default="grid_2x2",
+        help="Use one destination per 2x2 patch block or an equal-size global patch destination set.",
+    )
+    parser.add_argument(
+        "--token-merging-fastvggt-uniform-protect-ratio",
+        type=float,
+        default=0.0,
+        help="Additional uniformly protected token fraction used by spatial FastVGGT.",
+    )
+    parser.add_argument(
+        "--token-merging-fastvggt-exclusive-protection",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Protect only source candidates so protected tokens never duplicate destination tokens.",
+    )
+    parser.add_argument(
+        "--token-merging-fastvggt-protect-anchor-frames",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep all patch tokens from shared-anchor chunk frames out of FastVGGT source merging.",
+    )
     parser.add_argument("--token-merging-frame-restore-layer", type=int, default=16)
     parser.add_argument("--token-merging-frame-alpha", type=float, default=0.9)
     parser.add_argument("--token-merging-frame-segment-threshold", type=float, default=0.8)
@@ -228,6 +265,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--token-merging-frame-multi-max-group-size", type=int, default=2)
     parser.add_argument("--token-merging-frame-multi-pair-threshold", type=float, default=0.95)
     parser.add_argument("--token-merging-frame-multi-span-threshold", type=float, default=0.93)
+    parser.add_argument(
+        "--token-merging-frame-upper-adaptive",
+        action="store_true",
+        default=False,
+        help="For frame fusion only, raise pair/span thresholds together to target a 45%% merge rate above 50%% raw fusion.",
+    )
+    parser.add_argument(
+        "--token-merging-frame-staged-ranges",
+        default="0-9,10-17,18-23",
+        help="Comma-separated 0-based closed block ranges for frame_staged_adaptive_spatial.",
+    )
+    parser.add_argument("--token-merging-frame-staged-late-segment-threshold", type=float)
+    parser.add_argument("--token-merging-frame-staged-late-pair-threshold", type=float)
+    parser.add_argument("--token-merging-frame-staged-late-span-threshold", type=float)
     parser.add_argument("--token-merging-frame-protect-period", type=int, default=0)
     parser.add_argument("--token-merging-frame-protect-prefix", type=int, default=0)
     parser.add_argument(
@@ -277,7 +328,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--omega-accelerator",
-        choices=["none", "da_vggt", "sparse_vggt"],
+        choices=[
+            "none",
+            "da_vggt",
+            "sparse_vggt",
+            "shared_anchor_chunks",
+            "da_chunk_strided_shared_anchor",
+        ],
         default="none",
         help="Explicit external acceleration adapter; separate from the existing token-merging methods.",
     )
@@ -289,6 +346,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--da-vggt-n-anchors", type=int, default=1)
     parser.add_argument("--da-vggt-dino-batch-size", type=int, default=256)
     parser.add_argument("--da-vggt-lambda-div", type=float, default=0.0)
+    parser.add_argument("--da-chunk-strided-groups", type=int, default=5)
+    parser.add_argument("--da-chunk-strided-anchor-count", type=int, default=5)
+    parser.add_argument("--shared-anchor-num-chunks", type=int, default=10)
+    parser.add_argument("--shared-anchor-count", type=int, default=10)
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument(
         "--eval",
@@ -302,6 +363,11 @@ def parse_args() -> argparse.Namespace:
         dest="eval",
         action="store_false",
         help="Skip both video-depth and pose-AUC evaluation.",
+    )
+    parser.add_argument(
+        "--stats-only",
+        action="store_true",
+        help="With --no-eval, write only input/timing metadata and skip prediction, trajectory, and pose files.",
     )
     parser.add_argument("--eval-align", choices=["metric", "scale", "scale_shift"], default="scale_shift")
     parser.add_argument(
@@ -325,19 +391,11 @@ def parse_args() -> argparse.Namespace:
         default="test",
         help="7Scenes split to use when --dataset 7scenes. Defaults to the official test split.",
     )
-    parser.add_argument("--max-frames-per-seq", type=int, default=0, help="Limit each sequence to this many frames after stride.")
     parser.add_argument(
-        "--frame-sample-mode",
-        choices=["first", "random"],
-        default="first",
-        help="How to choose frames when --max-frames-per-seq is set.",
-    )
-    parser.add_argument("--frame-sample-seed", type=int, default=0, help="Seed for random frame input sampling.")
-    parser.add_argument(
-        "--frame-sample-random-order",
-        action="store_true",
-        default=False,
-        help="Keep random sample order instead of restoring chronological order; used for VGGT-style sparse-view evaluation.",
+        "--max-frames-per-seq",
+        type=int,
+        default=0,
+        help="Uniformly sample this many temporally ordered frames over each full sequence; 0 keeps all frames.",
     )
     return parser.parse_args()
 
@@ -483,27 +541,60 @@ def sequence_images(dataset: str, dataset_root: str | Path, seq: str, bonn_rgb_d
     return [str(path) for path in paths]
 
 
-def _sequence_seed(seed: int, sequence: str | None) -> int:
-    if not sequence:
-        return seed
-    digest = hashlib.sha1(sequence.encode("utf-8")).digest()
-    return (seed + int.from_bytes(digest[:4], "little")) % (2**32)
+def uniform_frame_indices(num_frames: int, max_frames: int) -> list[int]:
+    """Select temporally ordered views spanning the complete input sequence."""
+    if num_frames < 0:
+        raise ValueError("num_frames must be non-negative")
+    if not max_frames or max_frames <= 0 or num_frames <= max_frames:
+        return list(range(num_frames))
+    indices = np.linspace(0, num_frames - 1, num=max_frames, dtype=np.int64).tolist()
+    if len(indices) != max_frames or len(set(indices)) != max_frames:
+        raise RuntimeError(f"Uniform selection failed for {num_frames=} and {max_frames=}")
+    return indices
 
 
-def limit_frames(
-    paths: list[str],
-    max_frames: int,
-    sample_mode: str = "first",
-    seed: int = 0,
-    sequence: str | None = None,
-) -> list[str]:
-    if not max_frames or max_frames <= 0 or len(paths) <= max_frames:
-        return paths
-    if sample_mode == "random":
-        rng = np.random.default_rng(_sequence_seed(seed, sequence))
-        indices = sorted(rng.choice(len(paths), size=max_frames, replace=False).tolist())
-        return [paths[index] for index in indices]
-    return paths[:max_frames]
+def select_uniform_frames(paths: list[str], max_frames: int) -> tuple[list[str], list[int]]:
+    indices = uniform_frame_indices(len(paths), max_frames)
+    return [paths[index] for index in indices], indices
+
+
+def input_frames_manifest(source_count: int, selected_indices: list[int], images: list[str]) -> dict:
+    strides = np.diff(np.asarray(selected_indices, dtype=np.float64))
+    return {
+        "protocol": "uniform_full_sequence_v1",
+        "source_frame_count": source_count,
+        "selected_frame_count": len(images),
+        "selected_source_indices": selected_indices,
+        "mean_source_stride": float(strides.mean()) if len(strides) else 0.0,
+        "sampled_frames": [Path(image).name for image in images],
+    }
+
+
+def load_manifest_selected_images(output_dir: str | Path, source_images: list[str]) -> tuple[list[str], list[int]]:
+    """Recover exactly the RGB frames used by inference from its persisted manifest."""
+    manifest_path = Path(output_dir) / "_input_frames.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Missing input-frame manifest {manifest_path}; rerun inference with the uniform_full_sequence_v1 protocol."
+        )
+    with manifest_path.open() as handle:
+        manifest = json.load(handle)
+    if manifest.get("protocol") != "uniform_full_sequence_v1":
+        raise ValueError(f"Unsupported frame-selection protocol in {manifest_path}: {manifest.get('protocol')!r}")
+    indices = manifest.get("selected_source_indices")
+    if not isinstance(indices, list) or any(not isinstance(index, int) for index in indices):
+        raise ValueError(f"Invalid selected_source_indices in {manifest_path}")
+    if manifest.get("source_frame_count") != len(source_images):
+        raise ValueError(
+            f"{manifest_path}: source frame count {manifest.get('source_frame_count')} does not match "
+            f"the current dataset ({len(source_images)})."
+        )
+    if any(index < 0 or index >= len(source_images) for index in indices):
+        raise ValueError(f"{manifest_path}: selected source index is out of bounds")
+    images = [source_images[index] for index in indices]
+    if manifest.get("sampled_frames") != [Path(image).name for image in images]:
+        raise ValueError(f"{manifest_path}: sampled frame names no longer match the dataset")
+    return images, indices
 
 
 def bonn_associated_frames(
@@ -514,10 +605,7 @@ def bonn_associated_frames(
     depth_dir: str,
     max_difference: float,
     max_frames: int,
-    sample_mode: str,
-    sample_seed: int,
-    random_order: bool = False,
-) -> tuple[list[dict], list[str], list[str]]:
+) -> tuple[list[dict], list[str], list[str], list[int], int]:
     associations = build_bonn_associations(
         dataset_root,
         seq,
@@ -525,14 +613,11 @@ def bonn_associated_frames(
         depth_dir=depth_dir,
         max_difference=max_difference,
     )
-    if random_order and sample_mode == "random" and max_frames and len(associations) > max_frames:
-        rng = np.random.default_rng(_sequence_seed(sample_seed, seq))
-        indices = rng.choice(len(associations), size=max_frames, replace=False)
-        associations = [associations[int(index)] for index in indices]
-    else:
-        associations = limit_frames(associations, max_frames, sample_mode, sample_seed, seq)
+    source_count = len(associations)
+    indices = uniform_frame_indices(source_count, max_frames)
+    associations = [associations[index] for index in indices]
     images, depths = association_paths(dataset_root, seq, associations, rgb_dir=rgb_dir, depth_dir=depth_dir)
-    return associations, images, depths
+    return associations, images, depths, indices, source_count
 
 
 def _read_tum_poses(path: Path) -> np.ndarray:
@@ -701,14 +786,9 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
                 depth_dir=manifest["depth_dir"],
             )
         else:
-            images = limit_frames(
-                sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir),
-                args.max_frames_per_seq,
-                args.frame_sample_mode,
-                args.frame_sample_seed,
-                seq,
-            )
-            gt_paths = sequence_depths(
+            source_images = sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir)
+            images, selected_indices = load_manifest_selected_images(seq_dir, source_images)
+            all_gt_paths = sequence_depths(
                 dataset,
                 dataset_root,
                 seq,
@@ -716,14 +796,15 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
                 args.bonn_rgb_dir,
                 image_paths=images if dataset == "tum_dynamic" else None,
             )
-            if dataset != "tum_dynamic":
-                gt_paths = limit_frames(
-                    gt_paths,
-                    args.max_frames_per_seq,
-                    args.frame_sample_mode,
-                    args.frame_sample_seed,
-                    seq,
-                )
+            if dataset == "tum_dynamic":
+                gt_paths = all_gt_paths
+            else:
+                if len(all_gt_paths) != len(source_images):
+                    raise ValueError(
+                        f"{dataset}/{seq}: {len(all_gt_paths)} depth frames do not match "
+                        f"{len(source_images)} RGB frames."
+                    )
+                gt_paths = [all_gt_paths[index] for index in selected_indices]
         pred_paths = sorted(seq_dir.glob("frame_[0-9][0-9][0-9][0-9].npy"))
         if not (len(pred_paths) == len(gt_paths) == len(images)):
             raise ValueError(
@@ -795,11 +876,24 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
         row["da_vggt_num_chunks_mean"] = timing.get("da_vggt_num_chunks_mean")
         row["da_vggt_chunk_size"] = timing.get("da_vggt_chunk_size")
         row["da_vggt_sampling_method"] = timing.get("da_vggt_sampling_method")
+        row["shared_anchor_num_chunks_mean"] = timing.get("shared_anchor_num_chunks_mean")
+        row["shared_anchor_chunk_size"] = timing.get("shared_anchor_chunk_size")
+        row["shared_anchor_count"] = timing.get("shared_anchor_count")
+        row["shared_anchor_selection"] = timing.get("shared_anchor_selection")
         row["frame_merge_active_frames_mean"] = timing.get("frame_merge_active_frames_mean")
+        row["frame_merge_events"] = timing.get("frame_merge_events")
         row["frame_merge_retention_ratio_mean"] = timing.get("frame_merge_retention_ratio_mean")
         row["frame_merge_merge_ratio_mean"] = timing.get("frame_merge_merge_ratio_mean")
+        row["frame_merge_raw_merge_ratio_mean"] = timing.get("frame_merge_raw_merge_ratio_mean")
+        row["frame_merge_adaptive_policy"] = timing.get("frame_merge_adaptive_policy")
+        row["frame_merge_selected_pair_threshold_mean"] = timing.get("frame_merge_selected_pair_threshold_mean")
+        row["frame_merge_selected_span_threshold_mean"] = timing.get("frame_merge_selected_span_threshold_mean")
         row["frame_merge_anchor_count"] = timing.get("frame_merge_anchor_count")
         row["frame_merge_anchor_selection"] = timing.get("frame_merge_anchor_selection")
+        row["frame_fusion_cuda_ms_mean"] = timing.get("frame_fusion_cuda_ms_mean")
+        row["frame_fusion_cuda_ms_total"] = timing.get("frame_fusion_cuda_ms_total")
+        row["frame_fusion_host_wall_ms_mean"] = timing.get("frame_fusion_host_wall_ms_mean")
+        row["frame_fusion_host_wall_ms_total"] = timing.get("frame_fusion_host_wall_ms_total")
         row["frame_special_cross_attention_events"] = timing.get("frame_special_cross_attention_events")
         row["frame_special_cross_attention_alpha"] = timing.get("frame_special_cross_attention_alpha")
         row["token_merging_active_over_frame_merged_token_ratio_mean"] = timing.get(
@@ -858,6 +952,11 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
             "token_merging_frame_special_cross_attention_alpha",
             "frame_special_cross_attention_alpha",
             "frame_merge_anchor_selection",
+            "frame_merge_events",
+            "frame_fusion_cuda_ms_mean",
+            "frame_fusion_cuda_ms_total",
+            "frame_fusion_host_wall_ms_mean",
+            "frame_fusion_host_wall_ms_total",
             "omega_accelerator",
             "sparse_vggt_pool_mode",
             "da_vggt_sampling_method",
@@ -867,6 +966,13 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
     }
     total_frames = int(sum(row["frames"] for row in sequence_rows))
     total_time = float(sum(row["time"] for row in sequence_rows))
+    frame_fusion_events = sum(int(row.get("frame_merge_events") or 0) for row in sequence_rows)
+    for name in ("frame_fusion_cuda_ms", "frame_fusion_host_wall_ms"):
+        totals = [row.get(f"{name}_total") for row in sequence_rows]
+        if frame_fusion_events and all(isinstance(value, (int, float)) for value in totals):
+            total = float(sum(totals))
+            summary[f"{name}_total"] = total
+            summary[f"{name}_mean"] = total / frame_fusion_events
     summary["adaptive_fusion_final_token_over_initial_token_ratio_sequence_mean"] = (
         float(np.mean(final_token_over_initial_token_ratios))
         if final_token_over_initial_token_ratios
@@ -937,6 +1043,11 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
             "token_merging_flashvid_expansion": args.token_merging_flashvid_expansion,
             "token_merging_flashvid_pool_stride": args.token_merging_flashvid_pool_stride,
             "token_merging_flashvid_tstm_threshold": args.token_merging_flashvid_tstm_threshold,
+            "token_merging_fastvggt_destination_selector": args.token_merging_fastvggt_destination_selector,
+            "token_merging_fastvggt_destination_policy": args.token_merging_fastvggt_destination_policy,
+            "token_merging_fastvggt_uniform_protect_ratio": args.token_merging_fastvggt_uniform_protect_ratio,
+            "token_merging_fastvggt_exclusive_protection": args.token_merging_fastvggt_exclusive_protection,
+            "token_merging_fastvggt_protect_anchor_frames": args.token_merging_fastvggt_protect_anchor_frames,
             "token_merging_frame_restore_layer": args.token_merging_frame_restore_layer,
             "token_merging_frame_alpha": args.token_merging_frame_alpha,
             "token_merging_frame_segment_threshold": args.token_merging_frame_segment_threshold,
@@ -946,6 +1057,11 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
             "token_merging_frame_multi_max_group_size": args.token_merging_frame_multi_max_group_size,
             "token_merging_frame_multi_pair_threshold": args.token_merging_frame_multi_pair_threshold,
             "token_merging_frame_multi_span_threshold": args.token_merging_frame_multi_span_threshold,
+            "token_merging_frame_upper_adaptive": args.token_merging_frame_upper_adaptive,
+            "token_merging_frame_staged_ranges": args.token_merging_frame_staged_ranges,
+            "token_merging_frame_staged_late_segment_threshold": args.token_merging_frame_staged_late_segment_threshold,
+            "token_merging_frame_staged_late_pair_threshold": args.token_merging_frame_staged_late_pair_threshold,
+            "token_merging_frame_staged_late_span_threshold": args.token_merging_frame_staged_late_span_threshold,
             "token_merging_frame_group_strategy": args.token_merging_frame_group_strategy,
             "token_merging_frame_protect_period": args.token_merging_frame_protect_period,
             "token_merging_frame_protect_prefix": args.token_merging_frame_protect_prefix,
@@ -959,11 +1075,41 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
             if args.omega_accelerator == "sparse_vggt"
             else None,
             "sparse_vggt_pool_mode": args.sparse_vggt_pool_mode if args.omega_accelerator == "sparse_vggt" else None,
-            "da_vggt_max_frames": args.da_vggt_max_frames if args.omega_accelerator == "da_vggt" else None,
-            "da_vggt_sampling_method": args.da_vggt_sampling_method if args.omega_accelerator == "da_vggt" else None,
+            "da_vggt_max_frames": (
+                args.da_vggt_max_frames
+                if args.omega_accelerator in {"da_vggt", "da_chunk_strided_shared_anchor"}
+                else None
+            ),
+            "da_vggt_sampling_method": (
+                args.da_vggt_sampling_method
+                if args.omega_accelerator in {"da_vggt", "da_chunk_strided_shared_anchor"}
+                else None
+            ),
             "da_vggt_n_anchors": args.da_vggt_n_anchors if args.omega_accelerator == "da_vggt" else None,
-            "da_vggt_dino_batch_size": args.da_vggt_dino_batch_size if args.omega_accelerator == "da_vggt" else None,
-            "da_vggt_lambda_div": args.da_vggt_lambda_div if args.omega_accelerator == "da_vggt" else None,
+            "da_chunk_strided_groups": (
+                args.da_chunk_strided_groups
+                if args.omega_accelerator == "da_chunk_strided_shared_anchor"
+                else None
+            ),
+            "da_chunk_strided_anchor_count": (
+                args.da_chunk_strided_anchor_count
+                if args.omega_accelerator == "da_chunk_strided_shared_anchor"
+                else None
+            ),
+            "da_vggt_dino_batch_size": (
+                args.da_vggt_dino_batch_size
+                if args.omega_accelerator in {"da_vggt", "da_chunk_strided_shared_anchor"}
+                else None
+            ),
+            "da_vggt_lambda_div": (
+                args.da_vggt_lambda_div
+                if args.omega_accelerator in {"da_vggt", "da_chunk_strided_shared_anchor"}
+                else None
+            ),
+            "shared_anchor_num_chunks": (
+                args.shared_anchor_num_chunks if args.omega_accelerator == "shared_anchor_chunks" else None
+            ),
+            "shared_anchor_count": args.shared_anchor_count if args.omega_accelerator == "shared_anchor_chunks" else None,
             "eval_align": args.eval_align,
             "valid_pixels": int(weights.sum()),
         }
@@ -997,13 +1143,8 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
             )
             pose_indices = [item["pose_index"] for item in manifest["associations"]]
         else:
-            images = limit_frames(
-                sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir),
-                args.max_frames_per_seq,
-                args.frame_sample_mode,
-                args.frame_sample_seed,
-                seq,
-            )
+            source_images = sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir)
+            images, _ = load_manifest_selected_images(output_root / seq, source_images)
             pose_indices = None
         gt_poses = sequence_poses(dataset, dataset_root, seq, len(images), images, pose_indices=pose_indices)
         if pred_pose_path.is_file() and gt_poses is not None:
@@ -1041,8 +1182,20 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
                 "frame_merge_active_frames_mean": summary.get("frame_merge_active_frames_mean"),
                 "frame_merge_retention_ratio_mean": summary.get("frame_merge_retention_ratio_mean"),
                 "frame_merge_merge_ratio_mean": summary.get("frame_merge_merge_ratio_mean"),
+                "frame_merge_raw_merge_ratio_mean": summary.get("frame_merge_raw_merge_ratio_mean"),
+                "frame_merge_adaptive_policy": summary.get("frame_merge_adaptive_policy"),
+                "frame_merge_selected_pair_threshold_mean": summary.get(
+                    "frame_merge_selected_pair_threshold_mean"
+                ),
+                "frame_merge_selected_span_threshold_mean": summary.get(
+                    "frame_merge_selected_span_threshold_mean"
+                ),
                 "frame_merge_anchor_count": summary.get("frame_merge_anchor_count"),
                 "frame_merge_anchor_selection": summary.get("frame_merge_anchor_selection"),
+                "frame_fusion_cuda_ms_mean": summary.get("frame_fusion_cuda_ms_mean"),
+                "frame_fusion_cuda_ms_total": summary.get("frame_fusion_cuda_ms_total"),
+                "frame_fusion_host_wall_ms_mean": summary.get("frame_fusion_host_wall_ms_mean"),
+                "frame_fusion_host_wall_ms_total": summary.get("frame_fusion_host_wall_ms_total"),
                 "frame_special_cross_attention_events": summary.get("frame_special_cross_attention_events"),
                 "frame_special_cross_attention_alpha": summary.get("frame_special_cross_attention_alpha"),
                 "token_merging_active_over_frame_merged_token_ratio_mean": summary.get(
@@ -1080,6 +1233,8 @@ def maybe_evaluate_dataset(args: argparse.Namespace, dataset: str, dataset_root:
 
 def main() -> None:
     args = parse_args()
+    if args.stats_only and args.eval:
+        raise ValueError("--stats-only requires --no-eval")
     if args.dataset == "all" and args.dataset_root:
         raise ValueError("--dataset-root cannot be used with --dataset all; use the default dataset roots.")
     datasets = ["sintel", "bonn", "7scenes", "tum_dynamic", "nrgbd"] if args.dataset == "all" else [args.dataset]
@@ -1103,6 +1258,11 @@ def main() -> None:
         token_merging_flashvid_expansion=args.token_merging_flashvid_expansion,
         token_merging_flashvid_pool_stride=args.token_merging_flashvid_pool_stride,
         token_merging_flashvid_tstm_threshold=args.token_merging_flashvid_tstm_threshold,
+        token_merging_fastvggt_destination_selector=args.token_merging_fastvggt_destination_selector,
+        token_merging_fastvggt_destination_policy=args.token_merging_fastvggt_destination_policy,
+        token_merging_fastvggt_uniform_protect_ratio=args.token_merging_fastvggt_uniform_protect_ratio,
+        token_merging_fastvggt_exclusive_protection=args.token_merging_fastvggt_exclusive_protection,
+        token_merging_fastvggt_protect_anchor_frames=args.token_merging_fastvggt_protect_anchor_frames,
         token_merging_frame_restore_layer=args.token_merging_frame_restore_layer,
         token_merging_frame_alpha=args.token_merging_frame_alpha,
         token_merging_frame_segment_threshold=args.token_merging_frame_segment_threshold,
@@ -1112,6 +1272,11 @@ def main() -> None:
         token_merging_frame_multi_max_group_size=args.token_merging_frame_multi_max_group_size,
         token_merging_frame_multi_pair_threshold=args.token_merging_frame_multi_pair_threshold,
         token_merging_frame_multi_span_threshold=args.token_merging_frame_multi_span_threshold,
+        token_merging_frame_upper_adaptive=args.token_merging_frame_upper_adaptive,
+        token_merging_frame_staged_ranges=args.token_merging_frame_staged_ranges,
+        token_merging_frame_staged_late_segment_threshold=args.token_merging_frame_staged_late_segment_threshold,
+        token_merging_frame_staged_late_pair_threshold=args.token_merging_frame_staged_late_pair_threshold,
+        token_merging_frame_staged_late_span_threshold=args.token_merging_frame_staged_late_span_threshold,
         token_merging_frame_group_strategy=args.token_merging_frame_group_strategy,
         token_merging_frame_protect_period=args.token_merging_frame_protect_period,
         token_merging_frame_protect_prefix=args.token_merging_frame_protect_prefix,
@@ -1134,6 +1299,10 @@ def main() -> None:
         da_vggt_n_anchors=args.da_vggt_n_anchors,
         da_vggt_dino_batch_size=args.da_vggt_dino_batch_size,
         da_vggt_lambda_div=args.da_vggt_lambda_div,
+        da_chunk_strided_groups=args.da_chunk_strided_groups,
+        da_chunk_strided_anchor_count=args.da_chunk_strided_anchor_count,
+        shared_anchor_num_chunks=args.shared_anchor_num_chunks,
+        shared_anchor_count=args.shared_anchor_count,
         dynamic_fastvggt_schedule=args.dynamic_fastvggt_schedule,
         skip_global_attention_blocks=args.skip_global_attention_blocks,
         skip_inter_frame_attention_blocks=args.skip_inter_frame_attention_blocks,
@@ -1178,29 +1347,24 @@ def main() -> None:
             output_dir = output_root / seq
             bonn_associations = None
             if dataset == "bonn":
-                bonn_associations, images, _ = bonn_associated_frames(
+                bonn_associations, images, _, selected_indices, source_frame_count = bonn_associated_frames(
                     dataset_root,
                     seq,
                     rgb_dir=args.bonn_rgb_dir,
                     depth_dir=args.bonn_depth_dir,
                     max_difference=args.bonn_association_max_diff,
                     max_frames=args.max_frames_per_seq,
-                    sample_mode=args.frame_sample_mode,
-                    sample_seed=args.frame_sample_seed,
-                    random_order=args.frame_sample_random_order,
                 )
             else:
-                images = limit_frames(
-                    sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir),
-                    args.max_frames_per_seq,
-                    args.frame_sample_mode,
-                    args.frame_sample_seed,
-                    seq,
-                )
+                source_images = sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir)
+                images, selected_indices = select_uniform_frames(source_images, args.max_frames_per_seq)
+                source_frame_count = len(source_images)
             time_path = output_dir / "_time.json"
+            input_manifest_path = output_dir / "_input_frames.json"
             if (
                 not args.overwrite
                 and time_path.is_file()
+                and input_manifest_path.is_file()
                 and (dataset != "bonn" or (output_dir / "_bonn_associations.json").is_file())
                 and len(list(output_dir.glob("frame_[0-9][0-9][0-9][0-9].npy"))) == len(images)
             ):
@@ -1208,6 +1372,8 @@ def main() -> None:
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             output_dir.mkdir(parents=True, exist_ok=True)
+            with input_manifest_path.open("w") as handle:
+                json.dump(input_frames_manifest(source_frame_count, selected_indices, images), handle, indent=2)
             if bonn_associations is not None:
                 with (output_dir / "_bonn_associations.json").open("w") as handle:
                     json.dump(
@@ -1232,10 +1398,11 @@ def main() -> None:
             )
             similarity_matrix_files = save_frame_similarity_matrices(output_dir, speed_metrics)
             assert depths is not None
-            for frame_idx, depth in enumerate(depths.numpy()):
-                np.save(output_dir / f"frame_{frame_idx:04d}.npy", depth)
-                save_depth_preview(depth, output_dir / f"frame_{frame_idx:04d}.png")
-            if poses is not None:
+            if not args.stats_only:
+                for frame_idx, depth in enumerate(depths.numpy()):
+                    np.save(output_dir / f"frame_{frame_idx:04d}.npy", depth)
+                    save_depth_preview(depth, output_dir / f"frame_{frame_idx:04d}.png")
+            if poses is not None and not args.stats_only:
                 pred_poses = poses.numpy()
                 np.save(output_dir / "pred_poses.npy", pred_poses)
                 save_tum_trajectory(output_dir / "pred_traj.txt", pred_poses)
@@ -1280,9 +1447,12 @@ def main() -> None:
                         "seven_scenes_split": args.seven_scenes_split,
                         "pose_eval_frames": args.pose_eval_frames,
                         "pose_eval_seed": args.pose_eval_seed,
-                        "frame_sample_mode": args.frame_sample_mode,
-                        "frame_sample_seed": args.frame_sample_seed,
-                        "frame_sample_random_order": args.frame_sample_random_order,
+                        "frame_selection_protocol": "uniform_full_sequence_v1",
+                        "source_frame_count": source_frame_count,
+                        "selected_source_indices": selected_indices,
+                        "mean_source_stride": input_frames_manifest(
+                            source_frame_count, selected_indices, images
+                        )["mean_source_stride"],
                         "sampled_frames": [Path(image).name for image in images],
                         "inter_frame_attention": args.inter_frame_attention,
                         "register_patch_sample_tokens": args.register_patch_sample_tokens,
@@ -1327,6 +1497,11 @@ def main() -> None:
                         "token_merging_flashvid_expansion": args.token_merging_flashvid_expansion,
                         "token_merging_flashvid_pool_stride": args.token_merging_flashvid_pool_stride,
                         "token_merging_flashvid_tstm_threshold": args.token_merging_flashvid_tstm_threshold,
+                        "token_merging_fastvggt_destination_selector": args.token_merging_fastvggt_destination_selector,
+                        "token_merging_fastvggt_destination_policy": args.token_merging_fastvggt_destination_policy,
+                        "token_merging_fastvggt_uniform_protect_ratio": args.token_merging_fastvggt_uniform_protect_ratio,
+                        "token_merging_fastvggt_exclusive_protection": args.token_merging_fastvggt_exclusive_protection,
+                        "token_merging_fastvggt_protect_anchor_frames": args.token_merging_fastvggt_protect_anchor_frames,
                         "token_merging_frame_restore_layer": args.token_merging_frame_restore_layer,
                         "token_merging_frame_alpha": args.token_merging_frame_alpha,
                         "token_merging_frame_segment_threshold": args.token_merging_frame_segment_threshold,
@@ -1336,6 +1511,11 @@ def main() -> None:
                         "token_merging_frame_multi_max_group_size": args.token_merging_frame_multi_max_group_size,
                         "token_merging_frame_multi_pair_threshold": args.token_merging_frame_multi_pair_threshold,
                         "token_merging_frame_multi_span_threshold": args.token_merging_frame_multi_span_threshold,
+                        "token_merging_frame_upper_adaptive": args.token_merging_frame_upper_adaptive,
+                        "token_merging_frame_staged_ranges": args.token_merging_frame_staged_ranges,
+                        "token_merging_frame_staged_late_segment_threshold": args.token_merging_frame_staged_late_segment_threshold,
+                        "token_merging_frame_staged_late_pair_threshold": args.token_merging_frame_staged_late_pair_threshold,
+                        "token_merging_frame_staged_late_span_threshold": args.token_merging_frame_staged_late_span_threshold,
                         "token_merging_frame_group_strategy": args.token_merging_frame_group_strategy,
                         "token_merging_frame_protect_period": args.token_merging_frame_protect_period,
                         "token_merging_frame_protect_prefix": args.token_merging_frame_protect_prefix,
@@ -1359,15 +1539,45 @@ def main() -> None:
                         "sparse_vggt_pool_mode": args.sparse_vggt_pool_mode
                         if args.omega_accelerator == "sparse_vggt"
                         else None,
-                        "da_vggt_max_frames": args.da_vggt_max_frames if args.omega_accelerator == "da_vggt" else None,
-                        "da_vggt_sampling_method": args.da_vggt_sampling_method
-                        if args.omega_accelerator == "da_vggt"
-                        else None,
+                        "da_vggt_max_frames": (
+                            args.da_vggt_max_frames
+                            if args.omega_accelerator in {"da_vggt", "da_chunk_strided_shared_anchor"}
+                            else None
+                        ),
+                        "da_vggt_sampling_method": (
+                            args.da_vggt_sampling_method
+                            if args.omega_accelerator in {"da_vggt", "da_chunk_strided_shared_anchor"}
+                            else None
+                        ),
                         "da_vggt_n_anchors": args.da_vggt_n_anchors if args.omega_accelerator == "da_vggt" else None,
-                        "da_vggt_dino_batch_size": args.da_vggt_dino_batch_size
-                        if args.omega_accelerator == "da_vggt"
-                        else None,
-                        "da_vggt_lambda_div": args.da_vggt_lambda_div if args.omega_accelerator == "da_vggt" else None,
+                        "da_chunk_strided_groups": (
+                            args.da_chunk_strided_groups
+                            if args.omega_accelerator == "da_chunk_strided_shared_anchor"
+                            else None
+                        ),
+                        "da_chunk_strided_anchor_count": (
+                            args.da_chunk_strided_anchor_count
+                            if args.omega_accelerator == "da_chunk_strided_shared_anchor"
+                            else None
+                        ),
+                        "da_vggt_dino_batch_size": (
+                            args.da_vggt_dino_batch_size
+                            if args.omega_accelerator in {"da_vggt", "da_chunk_strided_shared_anchor"}
+                            else None
+                        ),
+                        "da_vggt_lambda_div": (
+                            args.da_vggt_lambda_div
+                            if args.omega_accelerator in {"da_vggt", "da_chunk_strided_shared_anchor"}
+                            else None
+                        ),
+                        "shared_anchor_num_chunks": (
+                            args.shared_anchor_num_chunks
+                            if args.omega_accelerator == "shared_anchor_chunks"
+                            else None
+                        ),
+                        "shared_anchor_count": (
+                            args.shared_anchor_count if args.omega_accelerator == "shared_anchor_chunks" else None
+                        ),
                         "frame_similarity_matrix_files": similarity_matrix_files,
                         "elapsed": elapsed,
                     },

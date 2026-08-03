@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 
@@ -20,11 +19,11 @@ except ImportError:  # pragma: no cover - runtime fallback for minimal environme
 
 if __package__:
     from .bonn_association import association_paths
-    from .infer import DEFAULT_DATASET_ROOTS, sequence_images, sequence_names, sequence_poses
+    from .infer import DEFAULT_DATASET_ROOTS, load_manifest_selected_images, sequence_images, sequence_names, sequence_poses
     from .pose_auc import evaluate_pose_auc, summarize_pose_auc, write_json
 else:
     from bonn_association import association_paths
-    from infer import DEFAULT_DATASET_ROOTS, sequence_images, sequence_names, sequence_poses
+    from infer import DEFAULT_DATASET_ROOTS, load_manifest_selected_images, sequence_images, sequence_names, sequence_poses
     from pose_auc import evaluate_pose_auc, summarize_pose_auc, write_json
 
 
@@ -63,38 +62,13 @@ def parse_args() -> argparse.Namespace:
         default="test",
         help="7Scenes split to use when --dataset 7scenes. Defaults to the official test split.",
     )
-    parser.add_argument("--max-frames-per-seq", type=int, default=0)
     parser.add_argument(
-        "--frame-sample-mode",
-        choices=["first", "random"],
-        default="first",
-        help="How to choose frames when --max-frames-per-seq is set.",
+        "--max-frames-per-seq",
+        type=int,
+        default=0,
+        help="Retained for command compatibility; evaluation always uses the frames recorded by inference.",
     )
-    parser.add_argument("--frame-sample-seed", type=int, default=0, help="Seed for random frame input sampling.")
     return parser.parse_args()
-
-
-def _sequence_seed(seed: int, sequence: str | None) -> int:
-    if not sequence:
-        return seed
-    digest = hashlib.sha1(sequence.encode("utf-8")).digest()
-    return (seed + int.from_bytes(digest[:4], "little")) % (2**32)
-
-
-def limit_frames(
-    paths: list[str],
-    max_frames: int,
-    sample_mode: str = "first",
-    seed: int = 0,
-    sequence: str | None = None,
-) -> list[str]:
-    if not max_frames or max_frames <= 0 or len(paths) <= max_frames:
-        return paths
-    if sample_mode == "random":
-        rng = np.random.default_rng(_sequence_seed(seed, sequence))
-        indices = sorted(rng.choice(len(paths), size=max_frames, replace=False).tolist())
-        return [paths[index] for index in indices]
-    return paths[:max_frames]
 
 
 def read_png_depth(filename: str | Path, scale: float) -> np.ndarray:
@@ -317,27 +291,25 @@ def evaluate_dataset(args: argparse.Namespace, dataset: str) -> dict:
                 depth_dir=bonn_manifest["depth_dir"],
             )
         else:
-            images = limit_frames(
-                sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir),
-                args.max_frames_per_seq,
-                args.frame_sample_mode,
-                args.frame_sample_seed,
+            source_images = sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir)
+            images, selected_indices = load_manifest_selected_images(pred_root / seq, source_images)
+            all_gt_paths = sequence_depths(
+                dataset,
+                dataset_root,
                 seq,
+                args.bonn_depth_dir,
+                args.bonn_rgb_dir,
+                image_paths=images if dataset == "tum_dynamic" else None,
             )
-            gt_paths = limit_frames(
-                sequence_depths(
-                    dataset,
-                    dataset_root,
-                    seq,
-                    args.bonn_depth_dir,
-                    args.bonn_rgb_dir,
-                    image_paths=images if dataset == "tum_dynamic" else None,
-                ),
-                args.max_frames_per_seq,
-                args.frame_sample_mode,
-                args.frame_sample_seed,
-                seq,
-            )
+            if dataset == "tum_dynamic":
+                gt_paths = all_gt_paths
+            else:
+                if len(all_gt_paths) != len(source_images):
+                    raise ValueError(
+                        f"{dataset}/{seq}: {len(all_gt_paths)} depth frames do not match "
+                        f"{len(source_images)} RGB frames."
+                    )
+                gt_paths = [all_gt_paths[index] for index in selected_indices]
         pred_paths = sorted((pred_root / seq).glob("frame_*.npy"))
         if not (len(pred_paths) == len(gt_paths) == len(images)):
             raise ValueError(
@@ -378,9 +350,18 @@ def evaluate_dataset(args: argparse.Namespace, dataset: str) -> dict:
         row["token_merging_flashvid_pool_stride"] = timing.get("token_merging_flashvid_pool_stride")
         row["frame_merge_anchor_count"] = timing.get("frame_merge_anchor_count")
         row["frame_merge_anchor_selection"] = timing.get("frame_merge_anchor_selection")
+        row["frame_merge_events"] = timing.get("frame_merge_events")
         row["frame_merge_active_frames_mean"] = timing.get("frame_merge_active_frames_mean")
         row["frame_merge_retention_ratio_mean"] = timing.get("frame_merge_retention_ratio_mean")
         row["frame_merge_merge_ratio_mean"] = timing.get("frame_merge_merge_ratio_mean")
+        row["frame_merge_raw_merge_ratio_mean"] = timing.get("frame_merge_raw_merge_ratio_mean")
+        row["frame_merge_adaptive_policy"] = timing.get("frame_merge_adaptive_policy")
+        row["frame_merge_selected_pair_threshold_mean"] = timing.get("frame_merge_selected_pair_threshold_mean")
+        row["frame_merge_selected_span_threshold_mean"] = timing.get("frame_merge_selected_span_threshold_mean")
+        row["frame_fusion_cuda_ms_mean"] = timing.get("frame_fusion_cuda_ms_mean")
+        row["frame_fusion_cuda_ms_total"] = timing.get("frame_fusion_cuda_ms_total")
+        row["frame_fusion_host_wall_ms_mean"] = timing.get("frame_fusion_host_wall_ms_mean")
+        row["frame_fusion_host_wall_ms_total"] = timing.get("frame_fusion_host_wall_ms_total")
         row["token_merging_active_over_frame_merged_token_ratio_mean"] = timing.get(
             "token_merging_active_over_frame_merged_token_ratio_mean"
         )
@@ -423,6 +404,11 @@ def evaluate_dataset(args: argparse.Namespace, dataset: str) -> dict:
             "token_merging_flashvid_pool_stride",
             "frame_merge_anchor_count",
             "frame_merge_anchor_selection",
+            "frame_merge_events",
+            "frame_fusion_cuda_ms_mean",
+            "frame_fusion_cuda_ms_total",
+            "frame_fusion_host_wall_ms_mean",
+            "frame_fusion_host_wall_ms_total",
             "depth_eval_protocol",
         }
         and all(isinstance(row.get(key), (int, float)) and row.get(key) is not None for row in sequence_rows)
@@ -440,6 +426,13 @@ def evaluate_dataset(args: argparse.Namespace, dataset: str) -> dict:
         summary["frame_merge_anchor_selection"] = anchor_selections.pop()
     total_frames = int(sum(row["frames"] for row in sequence_rows))
     total_time = float(sum(row["time"] for row in sequence_rows))
+    frame_fusion_events = sum(int(row.get("frame_merge_events") or 0) for row in sequence_rows)
+    for name in ("frame_fusion_cuda_ms", "frame_fusion_host_wall_ms"):
+        totals = [row.get(f"{name}_total") for row in sequence_rows]
+        if frame_fusion_events and all(isinstance(value, (int, float)) for value in totals):
+            total = float(sum(totals))
+            summary[f"{name}_total"] = total
+            summary[f"{name}_mean"] = total / frame_fusion_events
     summary["frames"] = total_frames
     summary["time"] = total_time
     summary["fps"] = float(total_frames / total_time) if total_time > 0 else 0.0
@@ -534,13 +527,8 @@ def evaluate_dataset(args: argparse.Namespace, dataset: str) -> dict:
             )
             pose_indices = [item["pose_index"] for item in bonn_manifest["associations"]]
         else:
-            images = limit_frames(
-                sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir),
-                args.max_frames_per_seq,
-                args.frame_sample_mode,
-                args.frame_sample_seed,
-                seq,
-            )
+            source_images = sequence_images(dataset, dataset_root, seq, args.bonn_rgb_dir)
+            images, _ = load_manifest_selected_images(pred_root / seq, source_images)
             pose_indices = None
         gt_poses = sequence_poses(dataset, dataset_root, seq, len(images), images, pose_indices=pose_indices)
         if pred_pose_path.is_file() and gt_poses is not None:
@@ -573,8 +561,16 @@ def evaluate_dataset(args: argparse.Namespace, dataset: str) -> dict:
         "frame_merge_active_frames_mean": summary.get("frame_merge_active_frames_mean"),
         "frame_merge_retention_ratio_mean": summary.get("frame_merge_retention_ratio_mean"),
         "frame_merge_merge_ratio_mean": summary.get("frame_merge_merge_ratio_mean"),
+        "frame_merge_raw_merge_ratio_mean": summary.get("frame_merge_raw_merge_ratio_mean"),
+        "frame_merge_adaptive_policy": summary.get("frame_merge_adaptive_policy"),
+        "frame_merge_selected_pair_threshold_mean": summary.get("frame_merge_selected_pair_threshold_mean"),
+        "frame_merge_selected_span_threshold_mean": summary.get("frame_merge_selected_span_threshold_mean"),
         "frame_merge_anchor_count": summary.get("frame_merge_anchor_count"),
         "frame_merge_anchor_selection": summary.get("frame_merge_anchor_selection"),
+        "frame_fusion_cuda_ms_mean": summary.get("frame_fusion_cuda_ms_mean"),
+        "frame_fusion_cuda_ms_total": summary.get("frame_fusion_cuda_ms_total"),
+        "frame_fusion_host_wall_ms_mean": summary.get("frame_fusion_host_wall_ms_mean"),
+        "frame_fusion_host_wall_ms_total": summary.get("frame_fusion_host_wall_ms_total"),
         "token_merging_active_over_frame_merged_token_ratio_mean": summary.get(
             "token_merging_active_over_frame_merged_token_ratio_mean"
         ),

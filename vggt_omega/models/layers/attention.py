@@ -84,6 +84,10 @@ class SelfAttention(nn.Module):
         self.fastvggt_patch_grid_size = None
         self.fastvggt_num_frames = None
         self.fastvggt_special_token_count = None
+        self.fastvggt_destination_selector = None
+        self.fastvggt_destination_policy = None
+        self.fastvggt_uniform_protect_ratio = None
+        self.fastvggt_exclusive_protection = False
         self.fastvggt_protected_token_indices = None
         self.fastvggt_dynamic_frame_mask = None
         # [B, F, P] bool labels used by dynamic-aware FastVGGT merging.
@@ -181,11 +185,16 @@ class SelfAttention(nn.Module):
             original_token_count = N
             merge, unmerge, dynamic_stats = _fastvggt_token_merge_bipartite2d(
                 q.transpose(1, 2).reshape(B, N, C),
+                token_importance=v.transpose(1, 2).reshape(B, N, C).float().norm(dim=-1),
                 patch_grid_size=self.fastvggt_patch_grid_size,
                 num_frames=self.fastvggt_num_frames,
                 special_token_count=self.fastvggt_special_token_count,
                 merge_ratio=self.fastvggt_merge_ratio,
                 protection=self.fastvggt_protection,
+                destination_selector=self.fastvggt_destination_selector,
+                destination_policy=self.fastvggt_destination_policy,
+                uniform_protect_ratio=self.fastvggt_uniform_protect_ratio,
+                exclusive_protection=self.fastvggt_exclusive_protection,
                 protected_token_indices=self.fastvggt_protected_token_indices,
                 dynamic_frame_mask=self.fastvggt_dynamic_frame_mask,
                 dynamic_patch_mask=self.fastvggt_dynamic_patch_mask,
@@ -258,11 +267,16 @@ def _sparse_vggt_attention_from_qkv(q: Tensor, k: Tensor, v: Tensor, config: dic
 
 def _fastvggt_token_merge_bipartite2d(
     metric: Tensor,
+    token_importance: Tensor | None,
     patch_grid_size: tuple[int, int],
     num_frames: int,
     special_token_count: int,
     merge_ratio: float,
     protection: str | None,
+    destination_selector: str | None,
+    destination_policy: str | None,
+    uniform_protect_ratio: float | None,
+    exclusive_protection: bool,
     protected_token_indices: Tensor | None = None,
     dynamic_frame_mask: Tensor | None = None,
     dynamic_patch_mask: Tensor | None = None,
@@ -281,35 +295,117 @@ def _fastvggt_token_merge_bipartite2d(
     sx = sy = 2
     hsy = grid_h // sy
     wsx = grid_w // sx
+    if destination_selector is None:
+        destination_selector = "random"
+    if destination_selector not in {"random", "local_medoid"}:
+        raise ValueError(f"Unknown FastVGGT destination selector: {destination_selector}")
+    if destination_policy is None:
+        destination_policy = "grid_2x2"
+    if destination_policy not in {"grid_2x2", "global_25pct"}:
+        raise ValueError(f"Unknown FastVGGT destination policy: {destination_policy}")
+    if uniform_protect_ratio is None:
+        uniform_protect_ratio = 0.1
+    if not 0.0 <= uniform_protect_ratio < 1.0:
+        raise ValueError("FastVGGT uniform protection ratio must be in [0, 1).")
+
     idx_buffer = torch.zeros(N, device=device, dtype=torch.long)
+    destination_stats: dict[str, int | float | str] = {
+        "destination_selector": destination_selector,
+        "destination_policy": destination_policy,
+        "uniform_protect_ratio": float(uniform_protect_ratio),
+        "exclusive_protection": bool(exclusive_protection),
+    }
 
     idx_buffer[:tokens_per_frame] = -1
     if num_frames > 1:
         frame_offsets = torch.arange(1, num_frames, device=device) * tokens_per_frame
         special = frame_offsets[:, None] + torch.arange(special_token_count, device=device)
         idx_buffer[special.flatten()] = -1
-
-        generator = torch.Generator(device=device)
-        generator.manual_seed(33)
-        rand = torch.randint(sy * sx, size=(num_frames - 1, hsy, wsx), device=device, generator=generator)
-        block = torch.zeros(num_frames - 1, hsy, wsx, sy * sx, device=device, dtype=torch.long)
-        block.scatter_(3, rand.unsqueeze(-1), -torch.ones_like(rand).unsqueeze(-1))
-        block = block.view(num_frames - 1, hsy, wsx, sy, sx).transpose(2, 3).reshape(
-            num_frames - 1, hsy * sy, wsx * sx
-        )
         effective_h = hsy * sy
         effective_w = wsx * sx
         effective_grid_size = effective_h * effective_w
-        for frame_idx in range(1, num_frames):
-            start = frame_idx * tokens_per_frame + special_token_count
-            idx_buffer[start : start + effective_grid_size] = block[frame_idx - 1].flatten()
+
+        if destination_policy == "grid_2x2":
+            if destination_selector == "random":
+                generator = torch.Generator(device=device)
+                generator.manual_seed(33)
+                rand = torch.randint(
+                    sy * sx,
+                    size=(num_frames - 1, hsy, wsx),
+                    device=device,
+                    generator=generator,
+                )
+            else:
+                # The standard FastVGGT path uses one shared merge map across
+                # the batch, so this deliberately follows its batch-0 convention.
+                patch_metric = metric[0].reshape(num_frames, tokens_per_frame, metric.shape[-1])[
+                    1:, special_token_count : special_token_count + effective_grid_size
+                ].reshape(num_frames - 1, hsy, sy, wsx, sx, metric.shape[-1])
+                patch_metric = patch_metric.permute(0, 1, 3, 2, 4, 5).reshape(
+                    num_frames - 1, hsy, wsx, sy * sx, metric.shape[-1]
+                )
+                with torch.no_grad():
+                    normalized_patch_metric = F.normalize(patch_metric.float(), dim=-1, eps=1e-6)
+                    local_similarity = normalized_patch_metric @ normalized_patch_metric.transpose(-1, -2)
+                    local_scores = (local_similarity.sum(dim=-1) - 1.0) / float(sy * sx - 1)
+                    medoid_indices = local_scores.argmax(dim=-1)
+
+                    # Local feature representativeness is the primary criterion.
+                    # For near-equivalent medoids, prefer the token with greater
+                    # value-feature energy, a cheap pre-attention importance cue.
+                    tie_margin = 0.01
+                    best_scores = local_scores.gather(-1, medoid_indices.unsqueeze(-1))
+                    tie_candidates = local_scores >= (best_scores - tie_margin)
+                    if token_importance is None:
+                        rand = medoid_indices
+                        destination_stats["destination_importance_tie_break"] = "disabled"
+                    else:
+                        patch_importance = token_importance[0].reshape(
+                            num_frames, tokens_per_frame
+                        )[1:, special_token_count : special_token_count + effective_grid_size]
+                        patch_importance = patch_importance.reshape(
+                            num_frames - 1, hsy, sy, wsx, sx
+                        ).permute(0, 1, 3, 2, 4).reshape(num_frames - 1, hsy, wsx, sy * sx)
+                        tie_importance = patch_importance.masked_fill(~tie_candidates, float("-inf"))
+                        rand = tie_importance.argmax(dim=-1)
+                        destination_stats["destination_importance_tie_break"] = "value_norm"
+                        destination_stats["destination_local_medoid_tie_margin"] = tie_margin
+                        destination_stats["destination_local_medoid_tie_rate"] = float(
+                            (tie_candidates.sum(dim=-1) > 1).float().mean().item()
+                        )
+                        destination_stats["destination_local_medoid_tie_change_rate"] = float(
+                            (rand != medoid_indices).float().mean().item()
+                        )
+                    destination_stats["destination_local_medoid_similarity"] = float(
+                        local_scores.gather(-1, rand.unsqueeze(-1)).mean().item()
+                    )
+            block = torch.zeros(num_frames - 1, hsy, wsx, sy * sx, device=device, dtype=torch.long)
+            block.scatter_(3, rand.unsqueeze(-1), -torch.ones_like(rand).unsqueeze(-1))
+            block = block.view(num_frames - 1, hsy, wsx, sy, sx).transpose(2, 3).reshape(
+                num_frames - 1, hsy * sy, wsx * sx
+            )
+            for frame_idx in range(1, num_frames):
+                start = frame_idx * tokens_per_frame + special_token_count
+                idx_buffer[start : start + effective_grid_size] = block[frame_idx - 1].flatten()
+        else:
+            # Preserve the 25% destination budget without the 2x2 spatial-coverage constraint.
+            num_patch_destinations = max(1, int(round((grid_h * grid_w) * 0.25)))
+            generator = torch.Generator(device=device)
+            generator.manual_seed(33)
+            random_scores = torch.rand(
+                (num_frames - 1, grid_h * grid_w), device=device, generator=generator
+            )
+            global_destinations = random_scores.topk(num_patch_destinations, dim=-1).indices
+            for frame_idx in range(1, num_frames):
+                start = frame_idx * tokens_per_frame + special_token_count
+                idx_buffer[start + global_destinations[frame_idx - 1]] = -1
 
     rand_idx = idx_buffer.reshape(1, -1, 1).argsort(dim=1)
     num_dst = int((idx_buffer == -1).sum())
     a_idx = rand_idx[:, num_dst:, :]
     b_idx = rand_idx[:, :num_dst, :]
 
-    dynamic_stats: dict[str, int | float] = {}
+    dynamic_stats: dict[str, int | float | str] = destination_stats
     token_types = None
     token_type_valid = None
     if dynamic_patch_mask is not None:
@@ -341,8 +437,30 @@ def _fastvggt_token_merge_bipartite2d(
     if r <= 0:
         return _merge_do_nothing, _merge_do_nothing, dynamic_stats
 
-    num_protected = int(N * 0.1)
-    if protection == "decoupled_window":
+    num_protected = int(N * uniform_protect_ratio)
+    if exclusive_protection:
+        source_indices = a_idx[0, :, 0]
+        uniform_count = min(num_protected, source_indices.numel())
+        if uniform_count:
+            positions = torch.div(
+                (torch.arange(uniform_count, device=device) * source_indices.numel()),
+                uniform_count,
+                rounding_mode="floor",
+            )
+            protected_indices = source_indices[positions]
+        else:
+            protected_indices = torch.empty(0, dtype=torch.long, device=device)
+        if protected_token_indices is not None and protected_token_indices.numel() > 0:
+            anchor_source_indices = protected_token_indices.to(device=device, dtype=torch.long)
+            anchor_source_indices = anchor_source_indices[torch.isin(anchor_source_indices, source_indices)]
+            protected_indices = torch.unique(
+                torch.cat([protected_indices, anchor_source_indices]), sorted=True
+            )
+        destination_stats["uniform_protected_source_tokens"] = int(uniform_count)
+        destination_stats["external_protected_source_tokens"] = int(
+            max(0, protected_indices.numel() - uniform_count)
+        )
+    elif protection == "decoupled_window":
         protected_indices = _decoupled_window_protected_indices(
             metric,
             patch_grid_size,
@@ -357,8 +475,11 @@ def _fastvggt_token_merge_bipartite2d(
         step = max(1, N // max(num_protected, 1))
         protected_indices = torch.arange(0, N, step, device=device)[:num_protected]
     if protected_token_indices is not None and protected_token_indices.numel() > 0:
-        protected_indices = torch.cat([protected_indices, protected_token_indices.to(device=device, dtype=torch.long)])
-        protected_indices = torch.unique(protected_indices.clamp(0, N - 1), sorted=True)
+        if not exclusive_protection:
+            protected_indices = torch.cat([protected_indices, protected_token_indices.to(device=device, dtype=torch.long)])
+            protected_indices = torch.unique(protected_indices.clamp(0, N - 1), sorted=True)
+    destination_stats["destination_tokens"] = int(num_dst)
+    destination_stats["protected_tokens"] = int(protected_indices.numel())
     protected_idx = protected_indices.unsqueeze(0).unsqueeze(-1)
     num_protected_actual = protected_idx.shape[1]
 

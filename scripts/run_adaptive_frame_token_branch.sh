@@ -227,7 +227,6 @@ TRANSFORMERS_CACHE="$ROOT/.cache/huggingface/hub" \
   "${DATASET_ARGS[@]}" \
   --sequences "${SEQUENCES[@]}" \
   --max-frames-per-seq 300 \
-  --frame-sample-mode first \
   --window-size 0 \
   --checkpoint "$CHECKPOINT" \
   --output-dir "$WORK_DIR" \

@@ -19,8 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-GROUP_THRESHOLDS = (0.995, 0.997, 0.998, 0.999)
-TOKEN_KEEP_RATIOS = (0.4, 0.6, 0.8, 0.9)
+DEFAULT_GROUP_THRESHOLDS = (0.995, 0.997, 0.998, 0.999)
+DEFAULT_TOKEN_KEEP_RATIOS = (0.4, 0.6, 0.8, 0.9)
 
 
 @dataclass(frozen=True)
@@ -38,6 +38,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--method", required=True)
+    parser.add_argument(
+        "--group-thresholds",
+        nargs="+",
+        type=float,
+        default=DEFAULT_GROUP_THRESHOLDS,
+        help="Frame-group cosine thresholds to evaluate.",
+    )
+    parser.add_argument(
+        "--token-keep-ratios",
+        nargs="+",
+        type=float,
+        default=DEFAULT_TOKEN_KEEP_RATIOS,
+        help="Fast bipartite patch-token retention ratios to evaluate.",
+    )
     parser.add_argument(
         "--result-root",
         type=Path,
@@ -154,8 +168,13 @@ def main() -> None:
     summary_root.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, object]] = []
 
-    for group_threshold in GROUP_THRESHOLDS:
-        for token_keep_ratio in TOKEN_KEEP_RATIOS:
+    if any(not 0.0 <= value <= 1.0 for value in args.group_thresholds):
+        raise ValueError("--group-thresholds values must be in [0, 1]")
+    if any(not 0.0 < value <= 1.0 for value in args.token_keep_ratios):
+        raise ValueError("--token-keep-ratios values must be in (0, 1]")
+
+    for group_threshold in args.group_thresholds:
+        for token_keep_ratio in args.token_keep_ratios:
             label = case_name(group_threshold, token_keep_ratio)
             candidate_root = temporary_root / label
             shutil.rmtree(candidate_root, ignore_errors=True)

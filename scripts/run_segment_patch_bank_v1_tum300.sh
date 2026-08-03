@@ -21,7 +21,6 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --dataset tum_dynamic \
   --dataset-root "$TUM_ROOT" \
   --max-frames-per-seq 300 \
-  --frame-sample-mode first \
   --window-size 0 \
   --checkpoint checkpoints/vggt_omega_1b_512.pt \
   --output-dir "$RUN_ROOT" \

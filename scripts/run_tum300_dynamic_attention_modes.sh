@@ -26,7 +26,6 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --dataset-root "$TUM_ROOT" \
   --output-dir "$RUN_ROOT/tum300_dynamic_attention_${MODE}" \
   --max-frames-per-seq 300 \
-  --frame-sample-mode first \
   --window-size 10 \
   --checkpoint "$ROOT/checkpoints/vggt_omega_1b_512.pt" \
   --dynamic-attention-mask "$MODE" \
