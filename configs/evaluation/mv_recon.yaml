@@ -1,0 +1,40 @@
+# @package _global_
+
+defaults:
+  - override /data: mv_recon
+
+name: mv_recon
+
+pi3:
+  pretrained_model_name_or_path: yyfz233/Pi3
+  # pretrained_model_name_or_path: checkpoints/Pi3
+  token_merging_method: none
+  token_merging_ratio: 0.9
+  token_merging_frame_alpha: 0.1
+  token_merging_frame_segment_threshold: 0.9
+  token_merging_frame_merge_threshold: 0.1
+  token_merging_frame_max_window: 20
+  token_merging_frame_pool_stride: 2
+  token_merging_frame_multi_max_group_size: 4
+  token_merging_frame_multi_pair_threshold: 0.95
+  token_merging_frame_multi_span_threshold: 0.93
+
+eval_datasets:
+  - 7scenes-sparse
+  - 7scenes-dense
+  - NRGBD-sparse
+  - NRGBD-dense
+  - DTU
+  - ETH3D
+
+no_crop: True
+load_img_size: 518
+max_frames_per_seq: 300
+
+device: cuda
+
+verbose: False
+
+seed: 42
+
+save_suffix: null

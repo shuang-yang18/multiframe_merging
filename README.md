@@ -178,6 +178,28 @@ print("Reconstruction complete!")
 # Access outputs: results['points'], results['camera_poses'] and results['local_points'].
 ```
 
+## VGGT-Omega-Compatible Video Evaluation
+
+`scripts/run_pi3_vggt_omega_eval.py` keeps Pi3's normal full-video inference
+path and evaluates each inferred sequence in the same process.  It reports
+the same primary metrics and protocols used by this workspace's VGGT-Omega
+evaluation: robust sequence-level `scale + shift` depth alignment, `Abs Rel`,
+`delta < 1.25`, official all-pair relative-pose `AUC@3` and `AUC@30`, and
+throughput in FPS.  No Sim(3) pose alignment is applied.
+
+Run TUM300 followed by the official 7Scenes test split in one command:
+
+```bash
+bash scripts/run_pi3_vggt_omega_eval.sh 0 outputs/pi3_vggt_omega_eval
+```
+
+The output contains per-sequence `_metrics.json`,
+`_sequence_metrics_scale_shift.csv`, `_summary_scale_shift.json`,
+`_summary_pose_auc.json`, and `_summary_complete_scale_shift.json` for each
+dataset.  Use `--token-merging-method fastvggt` or
+`--token-merging-method frame_persistent_spatial` after the output directory
+to evaluate the corresponding Pi3 acceleration interface.
+
 
 ## 🙏 Acknowledgements
 

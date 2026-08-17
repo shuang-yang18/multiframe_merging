@@ -23,3 +23,22 @@ ckpts
 
 resize_demo_imgs.py
 img_dir_to_video.py
+
+# Local model weights and downloaded checkpoints
+*.ckpt
+*.safetensors
+*.bin
+**/ckpts/
+**/checkpoints/
+
+# Generated inference, evaluation, and profiling artifacts
+**/outputs/
+**/eval_results/
+**/evaluation_results/
+**/predictions/
+**/logs/
+**/wandb/
+**/tensorboard/
+*.prof
+*.nsys-rep
+*.sqlite

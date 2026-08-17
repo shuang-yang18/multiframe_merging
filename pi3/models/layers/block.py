@@ -309,6 +309,11 @@ class BlockRope(nn.Module):
 
     def forward(self, x: Tensor, xpos=None) -> Tensor:
         def attn_residual_func(x: Tensor) -> Tensor:
+            # Unified U-M must average raw token embeddings before norm1 and
+            # Q/K/V projection.  The ordinary path remains unchanged.
+            if getattr(self.attn, "um_plan", None) is not None:
+                self.attn.um_norm1 = self.norm1
+                return self.ls1(self.attn(x, xpos=xpos))
             return self.ls1(self.attn(self.norm1(x), xpos=xpos))
 
         def ffn_residual_func(x: Tensor) -> Tensor:
