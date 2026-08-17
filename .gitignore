@@ -147,3 +147,30 @@ skyseg.onnx
 # pixi environments
 .pixi
 *.egg-info
+
+# Local model weights and downloaded checkpoints
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+/ckpts/
+/checkpoints/
+
+# Local datasets and generated evaluation artifacts
+/data/
+/datasets/
+/outputs/
+/vggt_eval_results/
+/evaluation_branch/
+**/outputs/
+**/eval_results/
+**/evaluation_results/
+**/predictions/
+**/logs/
+**/wandb/
+**/tensorboard/
+
+# Profiling artifacts
+*.nsys-rep
+*.sqlite
