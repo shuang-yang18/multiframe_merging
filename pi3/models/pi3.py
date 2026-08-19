@@ -62,6 +62,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         self.um_temporal_window = int(um_temporal_window)
         self.um_refresh_layers = {int(v) for v in um_refresh_layers.split(",") if v.strip()} if um_lambda_cost is not None else set()
         self._um_plan = None
+        # Populated once per U-M refresh during the most recent forward.  The
+        # evaluator consumes this to report token retention on the same
+        # full-patch-token basis as VGGT-Omega.
+        self.last_um_layer_retention = []
 
         # ----------------------
         #  Positonal Encoding
@@ -182,6 +186,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         frame_merge_state = None
         active_N = N
         self._um_plan = None
+        self.last_um_layer_retention = []
 
         if self.pos_type.startswith('rope'):
             pos = self.position_getter(B * N, H//self.patch_size, W//self.patch_size, hidden.device)
@@ -225,6 +230,14 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                             hidden, active_N, self.patch_start_idx, patch_grid_size,
                             self.um_spatial_radius, self.um_temporal_window, self.um_lambda_cost,
                         )
+                        full_patch_tokens = int(active_N * self._um_plan.patch_count)
+                        representative_count = int(self._um_plan.representative_source_indices.numel())
+                        self.last_um_layer_retention.append({
+                            "source_layer": int(global_block_idx),
+                            "representative_count": representative_count,
+                            "full_patch_tokens": full_patch_tokens,
+                            "patch_token_retention_percent": 100.0 * representative_count / full_patch_tokens,
+                        })
                     blk.attn.um_plan = self._um_plan
 
             try:

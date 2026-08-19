@@ -39,14 +39,16 @@ from utils.interfaces import load_and_resize14
 DEFAULT_ROOTS = {
     "tum_dynamic": ROOT.parent / "dataset" / "TUM-Dynamics",
     "7scenes": ROOT.parent / "dataset" / "7scenes",
+    "nrgbd": ROOT.parent / "dataset" / "NRGBD",
+    "scannet": ROOT.parent / "dataset" / "scannet30" / "raw",
 }
 # Match VGGT-Omega's standard TUM-Dynamics/7Scenes depth evaluation bounds.
-MAX_DEPTHS = {"tum_dynamic": 10.0, "7scenes": 10.0}
+MAX_DEPTHS = {"tum_dynamic": 10.0, "7scenes": 10.0, "nrgbd": 10.0, "scannet": 10.0}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", choices=["tum_dynamic", "7scenes", "all"], default="all")
+    parser.add_argument("--dataset", choices=["tum_dynamic", "7scenes", "nrgbd", "scannet", "all"], default="all")
     parser.add_argument("--dataset-root")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--pretrained", default="checkpoints/Pi3")
@@ -89,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sparse-vggt-sparse-ratio", type=float, default=0.5)
     parser.add_argument("--sparse-vggt-cdf-threshold", type=float, default=None)
     parser.add_argument("--sparse-vggt-pool-mode", choices=["avg", "max"], default="avg")
-    parser.add_argument("--um-lambda", type=float, default=0.03)
+    parser.add_argument("--um-lambda", type=float, default=0.04)
     parser.add_argument("--um-spatial-radius", type=int, default=2)
     parser.add_argument("--um-temporal-window", type=int, default=4)
     parser.add_argument("--um-refresh-layers", default="0,9")
@@ -127,6 +129,10 @@ def list_sequences(dataset: str, root: Path, args: argparse.Namespace) -> list[s
         sequences = list(args.sequences)
     elif dataset == "tum_dynamic":
         sequences = sorted(path.name for path in root.iterdir() if (path / "rgb").is_dir())
+    elif dataset == "nrgbd":
+        sequences = sorted(path.name for path in root.iterdir() if (path / "images").is_dir() and (path / "depth").is_dir() and (path / "poses.txt").is_file())
+    elif dataset == "scannet":
+        sequences = sorted(path.name for path in root.iterdir() if (path / ".complete").is_file() and (path / "color").is_dir() and (path / "depth").is_dir() and (path / "pose").is_dir() and (path / "intrinsic" / "intrinsic_color.txt").is_file())
     else:
         sequences = []
         for scene in sorted(path for path in root.iterdir() if path.is_dir() and path.name not in {"train", "test"}):
@@ -143,7 +149,27 @@ def sequence_dir(dataset: str, root: Path, sequence: str) -> Path:
 
 def sequence_images(dataset: str, root: Path, sequence: str) -> list[Path]:
     path = sequence_dir(dataset, root, sequence)
-    images = sorted((path / "rgb").glob("*.png")) if dataset == "tum_dynamic" else sorted(path.glob("*.color.png"))
+    images = (sorted((path / "rgb").glob("*.png")) if dataset == "tum_dynamic" else
+              sorted((path / "images").glob("img*.png"), key=lambda x: int(x.stem.removeprefix("img"))) if dataset == "nrgbd" else
+              sorted((path / "color").glob("*.jpg"), key=lambda x: int(x.stem)) if dataset == "scannet" else
+              sorted(path.glob("*.color.png")))
+    # ScanNet sens streams can contain tracking-loss frames whose 4x4 pose is
+    # NaN/Inf. Filter them before uniform sampling so a single invalid sampled
+    # frame never aborts the entire benchmark, and RGB/depth/pose stay aligned.
+    if dataset == "scannet":
+        valid_images: list[Path] = []
+        for image in images:
+            pose_path = path / "pose" / f"{image.stem}.txt"
+            depth_path = path / "depth" / f"{image.stem}.png"
+            if not pose_path.is_file() or not depth_path.is_file():
+                continue
+            try:
+                pose = np.loadtxt(pose_path, dtype=np.float64)
+            except (OSError, ValueError):
+                continue
+            if pose.shape == (4, 4) and np.isfinite(pose).all():
+                valid_images.append(image)
+        images = valid_images
     if not images:
         raise FileNotFoundError(f"No RGB images for {dataset}/{sequence}")
     return images
@@ -170,6 +196,16 @@ def tum_depth_paths(root: Path, sequence: str, images: list[Path]) -> list[Path]
 def sequence_depths(dataset: str, root: Path, sequence: str, images: list[Path]) -> list[Path]:
     if dataset == "tum_dynamic":
         return tum_depth_paths(root, sequence, images)
+    if dataset == "nrgbd":
+        depths = [root / sequence / "depth" / f"depth{image.stem.removeprefix('img')}.png" for image in images]
+        if any(not path.is_file() for path in depths):
+            raise FileNotFoundError(f"Missing NRGBD depth files for {sequence}")
+        return depths
+    if dataset == "scannet":
+        depths = [root / sequence / "depth" / f"{image.stem}.png" for image in images]
+        if any(not path.is_file() for path in depths):
+            raise FileNotFoundError(f"Missing ScanNet depth files for {sequence}")
+        return depths
     depths = []
     for image in images:
         projected = image.with_name(image.name.replace(".color.png", ".depth.proj.png"))
@@ -190,6 +226,21 @@ def tum_row_to_c2w(row: np.ndarray) -> np.ndarray:
 def sequence_poses(dataset: str, root: Path, sequence: str, images: list[Path]) -> np.ndarray:
     if dataset == "7scenes":
         return np.stack([np.loadtxt(image.with_name(image.name.replace(".color.png", ".pose.txt"))) for image in images])
+    if dataset == "nrgbd":
+        values = np.loadtxt(root / sequence / "poses.txt", dtype=np.float64)
+        if values.ndim != 2 or values.shape[1] != 4 or values.shape[0] % 4:
+            raise ValueError(f"Expected 4N x 4 NRGBD poses in {sequence}/poses.txt")
+        poses = values.reshape(-1, 4, 4)
+        poses[:, :3, 1:3] *= -1.0
+        indices = [int(image.stem.removeprefix("img")) for image in images]
+        return poses[np.asarray(indices, dtype=np.int64)]
+    if dataset == "scannet":
+        paths = [root / sequence / "pose" / f"{image.stem}.txt" for image in images]
+        poses = np.stack([np.loadtxt(path, dtype=np.float64) for path in paths])
+        valid = np.isfinite(poses).all(axis=(1, 2))
+        if not np.all(valid):
+            raise ValueError(f"ScanNet {sequence} contains non-finite poses for selected frames")
+        return poses
     values = np.atleast_2d(np.loadtxt(root / sequence / "groundtruth.txt", comments="#"))
     pose_times = values[:, 0]
     poses = np.stack([tum_row_to_c2w(row) for row in values])
@@ -234,20 +285,25 @@ def read_depth(dataset: str, path: Path) -> np.ndarray:
     return depth
 
 
-def geometry_intrinsic(dataset: str) -> np.ndarray:
+def geometry_intrinsic(dataset: str, root: Path | None = None, sequence: str | None = None) -> np.ndarray:
+    if dataset == "scannet":
+        if root is None or sequence is None:
+            raise ValueError("ScanNet geometry requires dataset root and sequence")
+        return np.loadtxt(root / sequence / "intrinsic" / "intrinsic_color.txt", dtype=np.float64)[:3, :3]
     # Matches Pi3's legacy 7Scenes/NRGBD geometry evaluator.
-    fx = fy = 525.0 if dataset == "7scenes" else 554.2562584220408
+    fx = fy = 554.2562584220408 if dataset == "tum_dynamic" else 525.0
     return np.array([[fx, 0.0, 320.0], [0.0, fy, 240.0], [0.0, 0.0, 1.0]], dtype=np.float64)
 
 
-def geometry_from_prediction(dataset: str, prediction: dict, gt_depth: np.ndarray, gt_c2w: np.ndarray) -> dict[str, float | int]:
+def geometry_from_prediction(dataset: str, prediction: dict, gt_depth: np.ndarray, gt_c2w: np.ndarray, root: Path | None = None, sequence: str | None = None) -> dict[str, float | int]:
     """Pi3 legacy geometry protocol on a deterministic 100k-point budget."""
     if "points" not in prediction:
         raise KeyError("Pi3 prediction lacks global 'points' required for geometry evaluation")
     pred_points = prediction["points"][0].detach().float().cpu().numpy()
     height, width = pred_points.shape[1:3]
     gt_small = np.stack([cv2.resize(frame, (width, height), interpolation=cv2.INTER_NEAREST) for frame in gt_depth])
-    gt_k = scaled_intrinsics(geometry_intrinsic(dataset), (gt_depth.shape[1], gt_depth.shape[2]), (height, width), len(gt_depth))
+    native_shape = (968, 1296) if dataset == "scannet" else (gt_depth.shape[1], gt_depth.shape[2])
+    gt_k = scaled_intrinsics(geometry_intrinsic(dataset, root, sequence), native_shape, (height, width), len(gt_depth))
     gt_points = depth_to_world_points(gt_small, gt_c2w, gt_k)
     valid = np.isfinite(gt_small) & (gt_small > 0) & (gt_small < MAX_DEPTHS[dataset])
     return evaluate_pi3_geometry(pred_points, gt_points, valid)
@@ -323,6 +379,21 @@ def sampled_indices(count: int, num_frames: int, seed: int, sequence: str) -> np
     if num_frames <= 0 or count <= num_frames:
         return np.arange(count, dtype=np.int64)
     return np.sort(np.random.default_rng(seed ^ zlib.crc32(sequence.encode())).choice(count, size=num_frames, replace=False))
+
+
+def um_process_retention_percent(layer_stats: list[dict], global_layer_count: int) -> float | None:
+    """Layer-span-weighted U-M retention, matching the VGGT-Omega protocol."""
+    if not layer_stats:
+        return None
+    by_layer = {int(row["source_layer"]): float(row["patch_token_retention_percent"]) for row in layer_stats}
+    refresh_layers = sorted(by_layer)
+    if refresh_layers[0] != 0:
+        raise ValueError("U-M token statistics require a refresh at global layer 0")
+    weighted_sum = 0.0
+    for index, layer in enumerate(refresh_layers):
+        end = refresh_layers[index + 1] if index + 1 < len(refresh_layers) else global_layer_count
+        weighted_sum += by_layer[layer] * (end - layer)
+    return weighted_sum / global_layer_count
 
 
 def evaluate_pose_auc(pred_c2w: np.ndarray, gt_c2w: np.ndarray, args: argparse.Namespace, sequence: str) -> dict:
@@ -515,7 +586,16 @@ def run_dataset(args: argparse.Namespace, model: Pi3, device: torch.device, data
                       "source_frame_indices": source_indices,
                       "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / (1024**3) if device.type == "cuda" else None,
                       "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / (1024**3) if device.type == "cuda" else None})
-        depth.update(geometry_from_prediction(dataset, prediction, gt_depth, gt_poses))
+        if args.acceleration_method == "u-m":
+            layer_stats = [dict(row) for row in model.last_um_layer_retention]
+            retention = um_process_retention_percent(layer_stats, len(model.decoder) // 2)
+            depth.update({
+                "um_layer_retention": layer_stats,
+                "um_global_layer_count": len(model.decoder) // 2,
+                "um_process_token_retention_percent": retention,
+                "um_process_token_compression_percent": None if retention is None else 100.0 - retention,
+            })
+        depth.update(geometry_from_prediction(dataset, prediction, gt_depth, gt_poses, root, sequence))
         pose = evaluate_pose_auc(pred_poses, gt_poses, args, sequence)
         depth_rows.append(depth)
         pose_rows.append(pose)
@@ -548,6 +628,10 @@ def run_dataset(args: argparse.Namespace, model: Pi3, device: torch.device, data
     })
     for geometry_key in ("acc_mean_m", "acc_median_m", "comp_mean_m", "comp_median_m", "nc_mean", "nc_median", "chamfer_mean_m", "chamfer_median_m"):
         depth_summary[geometry_key] = float(np.mean([row[geometry_key] for row in depth_rows]))
+    if selected_method == "u-m":
+        retention_values = [row["um_process_token_retention_percent"] for row in depth_rows]
+        depth_summary["um_process_token_retention_percent"] = float(np.mean(retention_values))
+        depth_summary["um_process_token_compression_percent"] = 100.0 - depth_summary["um_process_token_retention_percent"]
     complete = {"video_depth": depth_summary, "pose_auc": pose_summary, "speed": {"frames": total_frames, "time": total_time, "fps": depth_summary["fps"]}}
     complete["overall"] = {
         "abs_rel": depth_summary["Abs Rel"],
@@ -561,6 +645,11 @@ def run_dataset(args: argparse.Namespace, model: Pi3, device: torch.device, data
         "peak_reserved_gib_max": depth_summary["peak_reserved_gib_max"],
     }
     complete["overall"].update({key: depth_summary[key] for key in ("acc_mean_m", "acc_median_m", "comp_mean_m", "comp_median_m", "nc_mean", "nc_median", "chamfer_mean_m", "chamfer_median_m")})
+    if selected_method == "u-m":
+        complete["overall"].update({
+            "um_process_token_retention_percent": depth_summary["um_process_token_retention_percent"],
+            "um_process_token_compression_percent": depth_summary["um_process_token_compression_percent"],
+        })
     complete["per_sequence"] = depth_rows
     write_csv(output_root / "_sequence_metrics_scale_shift.csv", depth_rows)
     write_json(output_root / "_summary_scale_shift.json", depth_summary)
@@ -573,7 +662,7 @@ def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
     model = build_model(args, device)
-    for dataset in ("tum_dynamic", "7scenes") if args.dataset == "all" else (args.dataset,):
+    for dataset in ("tum_dynamic", "7scenes", "nrgbd", "scannet") if args.dataset == "all" else (args.dataset,):
         run_dataset(args, model, device, dataset)
 
 
