@@ -212,7 +212,7 @@ def load_model(
     um_lambda_cost: float | None = None,
     um_spatial_radius: int = 2,
     um_temporal_window: int = 4,
-    um_refresh_layers: str = "0,9,16",
+    um_refresh_layers: str = "0,9,21",
 ) -> VGGT:
     checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.is_file():

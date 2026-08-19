@@ -97,7 +97,7 @@ class Aggregator(nn.Module):
         um_lambda_cost: float | None = None,
         um_spatial_radius: int = 2,
         um_temporal_window: int = 4,
-        um_refresh_layers: str = "0,9,16",
+        um_refresh_layers: str = "0,9,21",
     ):
         super().__init__()
 

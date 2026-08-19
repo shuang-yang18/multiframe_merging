@@ -33,13 +33,15 @@ from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 DATA_ROOTS = {"tum_dynamic": Path("/data/mmc_syang/dataset/TUM-Dynamics"),
-              "7scenes": Path("/data/mmc_syang/dataset/7scenes")}
-MAX_DEPTHS = {"tum_dynamic": 10.0, "7scenes": 10.0}
+              "7scenes": Path("/data/mmc_syang/dataset/7scenes"),
+              "nrgbd": Path("/data/mmc_syang/dataset/NRGBD"),
+              "scannet": Path("/data/mmc_syang/dataset/scannet30/raw")}
+MAX_DEPTHS = {"tum_dynamic": 10.0, "7scenes": 10.0, "nrgbd": 10.0, "scannet": 10.0}
 
 
 def args_parse():
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset", choices=("tum_dynamic", "7scenes"), required=True)
+    p.add_argument("--dataset", choices=("tum_dynamic", "7scenes", "nrgbd", "scannet"), required=True)
     p.add_argument("--dataset-root", type=Path)
     p.add_argument("--checkpoint", type=Path, default=ROOT / "checkpoints/vggt_1b.pt")
     p.add_argument("--output-dir", type=Path, required=True)
@@ -61,10 +63,10 @@ def args_parse():
     p.add_argument("--sparse-vggt-sparse-ratio", type=float, default=0.5)
     p.add_argument("--sparse-vggt-cdf-threshold", type=float, default=None)
     p.add_argument("--sparse-vggt-pool-mode", choices=("avg", "max"), default="avg")
-    p.add_argument("--um-lambda", type=float, default=0.02)
+    p.add_argument("--um-lambda", type=float, default=0.04)
     p.add_argument("--um-spatial-radius", type=int, default=2)
     p.add_argument("--um-temporal-window", type=int, default=4)
-    p.add_argument("--um-refresh-layers", default="0,9,16")
+    p.add_argument("--um-refresh-layers", default="0,9,21")
     p.add_argument("--attention-probe-output", type=Path, default=None,
                    help="Optional directory for one full-token global-attention TIFF set; disabled by default.")
     p.add_argument("--attention-probe-query-chunk", type=int, default=128)
@@ -92,6 +94,10 @@ def compact_input_frames(paths: list[str], input_frames: int, sampling_pool_fram
 
 
 def gt_depths(dataset: str, root: Path, seq: str, images: list[str]) -> list[Path]:
+    if dataset == "nrgbd":
+        return [root / seq / "depth" / f"depth{Path(image).stem.removeprefix('img')}.png" for image in images]
+    if dataset == "scannet":
+        return [root / seq / "depth" / f"{Path(image).stem}.png" for image in images]
     if dataset == "7scenes":
         out = []
         for image in images:
@@ -185,6 +191,8 @@ def depth_metrics_batched(
 
 def geometry_metrics(
     dataset: str,
+    root: Path,
+    seq: str,
     predicted_depth: np.ndarray,
     pred_c2w: np.ndarray,
     ground_truth_depth: np.ndarray,
@@ -192,9 +200,16 @@ def geometry_metrics(
 ) -> dict[str, float | int]:
     """Pi3-compatible Sim(3)+ICP reconstruction metrics on model-resolution maps."""
     height, width = predicted_depth.shape[1:]
-    focal = 554.2562584220408 if dataset == "tum_dynamic" else 525.0
-    intrinsic = np.array([[focal, 0.0, 320.0], [0.0, focal, 240.0], [0.0, 0.0, 1.0]])
-    intrinsics = scaled_intrinsics(intrinsic, (480, 640), (height, width), len(predicted_depth))
+    if dataset == "scannet":
+        # Raw depths are 640x480 but share the RGB viewing ray after scaling;
+        # use the scene's RGB calibration and its native colour resolution.
+        intrinsic = np.loadtxt(root / seq / "intrinsic" / "intrinsic_color.txt", dtype=np.float64)[:3, :3]
+        native_shape = (968, 1296)
+    else:
+        focal = 554.2562584220408 if dataset == "tum_dynamic" else 525.0
+        intrinsic = np.array([[focal, 0.0, 320.0], [0.0, focal, 240.0], [0.0, 0.0, 1.0]])
+        native_shape = (480, 640)
+    intrinsics = scaled_intrinsics(intrinsic, native_shape, (height, width), len(predicted_depth))
     pred_points = depth_to_world_points(predicted_depth, pred_c2w, intrinsics)
     gt_points = depth_to_world_points(ground_truth_depth, gt_c2w, intrinsics)
     valid = (
@@ -270,7 +285,10 @@ def main():
             verbose=True,
         )
     model.eval()
-    sequences = sequence_names(a.dataset, root, a.sequences, True, "test")
+    if a.dataset == "nrgbd":
+        sequences = list(a.sequences) if a.sequences else sorted(path.name for path in root.iterdir() if (path / "images").is_dir() and (path / "depth").is_dir() and (path / "poses.txt").is_file())
+    else:
+        sequences = sequence_names(a.dataset, root, a.sequences, True, "test")
     rows = []; pose_rows = []; total_ms = 0.0
     for seq in sequences:
         all_images = sequence_images(a.dataset, root, seq)
@@ -317,7 +335,7 @@ def main():
         um_stats = [stat for stat in merge_stats if stat.get("mode") == "u-m"]
         row = {"sequence": seq, "acceleration_method": a.acceleration_method, "abs_rel": abs_rel/valid, "delta_1_25_percent": 100*delta/valid, "auc_3_percent": pose_metric["AUC@3"], "auc_15_percent": pose_metric["AUC@15"], "auc_30_percent": pose_metric["AUC@30"], "model_latency_ms": latency, "fps": len(images)/(latency/1000), "frames": len(images), "sampling_mode": sampling_mode, "sampling_pool_frames_requested": a.sampling_pool_frames, "source_frame_indices": source_indices, "patch_retention_percent": retention, "um_edge_score_backend": um_stats[-1].get("um_edge_score_backend") if um_stats else None, "um_layer_retention_percent": [100.0 * float(stat["full_attention_token_ratio"]) for stat in um_stats], "depth_alignment": "per-frame-batched-irls-20x32768", "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / (1024**3) if device.type == "cuda" else None, "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / (1024**3) if device.type == "cuda" else None}
         if pose is not None and gt_pose is not None:
-            row.update(geometry_metrics(a.dataset, pred, pose, gt, gt_pose))
+            row.update(geometry_metrics(a.dataset, root, seq, pred, pose, gt, gt_pose))
         rows.append(row); pose_rows.append(pose_metric)
         print(f"{seq}: AbsRel={row['abs_rel']:.4f}, AUC@3={row['auc_3_percent']:.2f}, latency={latency:.1f}ms")
     pose_summary = summarize_pose_auc(pose_rows)

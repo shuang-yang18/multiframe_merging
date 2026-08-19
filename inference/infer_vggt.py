@@ -48,12 +48,13 @@ DEFAULT_DATASET_ROOTS = {
     "7scenes": "datasets/7scenes",
     "tum_dynamic": "datasets/TUM-Dynamics",
     "nrgbd": "datasets/NRGBD",
+    "scannet": "datasets/scannet30/raw",
 }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", choices=["sintel", "bonn", "7scenes", "tum_dynamic", "nrgbd", "all"], default="all")
+    parser.add_argument("--dataset", choices=["sintel", "bonn", "7scenes", "tum_dynamic", "nrgbd", "scannet", "all"], default="all")
     parser.add_argument("--dataset-root")
     parser.add_argument("--bonn-rgb-dir", default="rgb_110", help="Bonn RGB subdirectory; use 'rgb' for full-length sequences.")
     parser.add_argument("--bonn-depth-dir", default="depth_110", help="Bonn depth subdirectory; use 'depth' for full-length sequences.")
@@ -408,6 +409,15 @@ def sequence_names(
                 f"Missing NRGBD images/depth/poses.txt below {dataset_root}: {missing}"
             )
         return requested
+    if dataset == "scannet":
+        root = Path(dataset_root)
+        if all_scenes and not requested:
+            requested = sorted(path.name for path in root.iterdir() if path.is_dir())
+        requested = requested or sorted(path.name for path in root.iterdir() if path.is_dir())
+        missing = [seq for seq in requested if not ((root / seq / ".complete").is_file() and (root / seq / "color").is_dir() and (root / seq / "depth").is_dir() and (root / seq / "pose").is_dir() and (root / seq / "intrinsic" / "intrinsic_color.txt").is_file())]
+        if missing:
+            raise FileNotFoundError(f"Missing ScanNet color/depth/pose/intrinsic files below {dataset_root}: {missing}")
+        return requested
     if requested:
         requested = requested
     elif bonn_split == "all":
@@ -440,6 +450,27 @@ def sequence_images(dataset: str, dataset_root: str | Path, seq: str, bonn_rgb_d
         )
         if not paths:
             raise FileNotFoundError(f"No NRGBD input images found for sequence {seq}")
+        return [str(path) for path in paths]
+    if dataset == "scannet":
+        paths = sorted((Path(dataset_root) / seq / "color").glob("*.jpg"), key=lambda path: int(path.stem))
+        # Ignore tracking-loss frames before sampling. ScanNet encodes these
+        # poses as NaN/Inf; keeping them makes an otherwise valid sequence
+        # fail only after the expensive model forward has been scheduled.
+        valid_paths = []
+        for path in paths:
+            pose_path = Path(dataset_root) / seq / "pose" / f"{path.stem}.txt"
+            depth_path = Path(dataset_root) / seq / "depth" / f"{path.stem}.png"
+            if not pose_path.is_file() or not depth_path.is_file():
+                continue
+            try:
+                pose = np.loadtxt(pose_path, dtype=np.float64)
+            except (OSError, ValueError):
+                continue
+            if pose.shape == (4, 4) and np.isfinite(pose).all():
+                valid_paths.append(path)
+        paths = valid_paths
+        if not paths:
+            raise FileNotFoundError(f"No ScanNet input images found for sequence {seq}")
         return [str(path) for path in paths]
     paths = sorted((Path(dataset_root) / seq / bonn_rgb_dir).glob("*.png"))
     if not paths:
@@ -573,6 +604,15 @@ def sequence_poses(
             return poses[:frame_count]
         indices = [int(Path(path).stem.removeprefix("img")) for path in image_paths[:frame_count]]
         return poses[np.asarray(indices, dtype=np.int64)]
+    if dataset == "scannet":
+        if image_paths is None:
+            paths = sorted((root / seq / "pose").glob("*.txt"), key=lambda path: int(path.stem))[:frame_count]
+        else:
+            paths = [root / seq / "pose" / f"{Path(path).stem}.txt" for path in image_paths[:frame_count]]
+        poses = np.stack([np.loadtxt(path, dtype=np.float64) for path in paths])
+        if not np.isfinite(poses).all():
+            raise ValueError(f"ScanNet {seq} has non-finite selected camera poses")
+        return poses
     return None
 
 
