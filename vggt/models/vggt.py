@@ -48,6 +48,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         um_refresh_layers: str = "0,9,21",
     ):
         super().__init__()
+        self.explicit_bfloat16_inference = False
 
         self.aggregator = Aggregator(
             img_size=img_size,
@@ -115,7 +116,15 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
         predictions = {}
 
-        with torch.cuda.amp.autocast(enabled=False):
+        # The legacy evaluator keeps heads in FP32 after an autocast encoder.
+        # FastVGGT's long-video setup instead converts the whole model to bf16;
+        # retain bf16 through the heads in that explicit inference mode.
+        head_autocast = bool(self.explicit_bfloat16_inference and images.is_cuda)
+        with torch.autocast(
+            device_type="cuda" if images.is_cuda else "cpu",
+            dtype=torch.bfloat16,
+            enabled=head_autocast,
+        ):
             if self.camera_head is not None:
                 pose_enc_list = self.camera_head(aggregated_tokens_list)
                 predictions["pose_enc"] = pose_enc_list[-1]  # pose encoding of the last iteration

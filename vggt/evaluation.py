@@ -213,6 +213,7 @@ def load_model(
     um_spatial_radius: int = 2,
     um_temporal_window: int = 4,
     um_refresh_layers: str = "0,9,21",
+    model_bfloat16: bool = True,
 ) -> VGGT:
     checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.is_file():
@@ -253,7 +254,11 @@ def load_model(
     unexpected = [key for key in unexpected if not key.startswith(("point_head.", "track_head."))]
     if missing or unexpected:
         raise RuntimeError(f"Checkpoint mismatch: missing={missing[:5]}, unexpected={unexpected[:5]}")
-    return model.to(device)
+    model = model.to(device)
+    if model_bfloat16:
+        model = model.to(dtype=torch.bfloat16)
+        model.explicit_bfloat16_inference = True
+    return model
 
 
 def register_attention_indices(inter_frame_attention: str) -> list[int] | None:

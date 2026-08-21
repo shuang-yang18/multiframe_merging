@@ -99,6 +99,8 @@ def evaluate_pose_auc(
 
     return {
         "AUC@3": _auc(pose_errors, 3.0),
+        "AUC@5": _auc(pose_errors, 5.0),
+        "AUC@10": _auc(pose_errors, 10.0),
         "AUC@15": _auc(pose_errors, 15.0),
         "AUC@30": _auc(pose_errors, 30.0),
         "frames": int(count),
@@ -133,6 +135,8 @@ def summarize_pose_auc(rows: list[dict]) -> dict:
         translation_errors.extend(row.get("translation_errors_deg", []))
     summary = {
         "AUC@3": _auc(pose_errors, 3.0),
+        "AUC@5": _auc(pose_errors, 5.0),
+        "AUC@10": _auc(pose_errors, 10.0),
         "AUC@15": _auc(pose_errors, 15.0),
         "AUC@30": _auc(pose_errors, 30.0),
         "sequences": len(rows),

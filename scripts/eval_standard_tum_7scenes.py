@@ -24,7 +24,7 @@ SHARED_ROOT = Path("/data/mmc_syang")
 if str(SHARED_ROOT) not in sys.path:
     sys.path.insert(0, str(SHARED_ROOT))
 
-from geometry_eval import depth_to_world_points, evaluate_pi3_geometry, scaled_intrinsics
+from geometry_eval import depth_to_world_points, evaluate_pi3_geometry, scaled_intrinsics, trajectory_pose_metrics
 
 from inference.infer_vggt import sequence_images, sequence_names, sequence_poses
 from inference.pose_auc import evaluate_pose_auc, summarize_pose_auc
@@ -47,6 +47,10 @@ def args_parse():
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--device", default="cuda")
     p.add_argument("--num-frames", type=int, default=300)
+    p.add_argument(
+        "--sampling-stride", type=int, default=3,
+        help="For sequences longer than stride * num-frames, select frames from index 0 at this fixed stride.",
+    )
     p.add_argument("--sampling-pool-frames", type=int, default=0,
                    help="Uniformly form this many source candidates, then use the first --num-frames; short sequences use source first frames.")
     p.add_argument("--timing-repeats", type=int, default=3)
@@ -67,6 +71,14 @@ def args_parse():
     p.add_argument("--um-spatial-radius", type=int, default=2)
     p.add_argument("--um-temporal-window", type=int, default=4)
     p.add_argument("--um-refresh-layers", default="0,9,21")
+    p.add_argument(
+        "--model-bfloat16", dest="model_bfloat16", action="store_true", default=True,
+        help="Use the default full-model bf16 inference path.",
+    )
+    p.add_argument(
+        "--model-fp32", dest="model_bfloat16", action="store_false",
+        help="Disable full-model bf16 inference (diagnostic compatibility option).",
+    )
     p.add_argument("--attention-probe-output", type=Path, default=None,
                    help="Optional directory for one full-token global-attention TIFF set; disabled by default.")
     p.add_argument("--attention-probe-query-chunk", type=int, default=128)
@@ -130,7 +142,7 @@ def read_depth(dataset: str, path: Path) -> np.ndarray:
 def depth_metrics_batched(
     predictions: np.ndarray, ground_truth: np.ndarray, max_depth: float,
     fit_samples: int = 32768, batch_size: int = 32,
-) -> tuple[float, float, int]:
+) -> dict[str, float]:
     """Per-frame robust scale/shift, fitted in CPU batches then scored at full size.
 
     This preserves the original protocol (one independent IRLS fit per frame),
@@ -142,8 +154,8 @@ def depth_metrics_batched(
         raise ValueError(f"Depth shape mismatch: {predictions.shape} vs {ground_truth.shape}")
     frames, height, width = predictions.shape
     sample_ids = np.linspace(0, height * width - 1, min(fit_samples, height * width), dtype=np.int64)
-    abs_rel_sum = 0.0
-    delta_count = 0
+    abs_rel_sum = sq_rel_sum = squared_sum = log_squared_sum = mae_sum = 0.0
+    delta_count = delta2_count = delta3_count = 0
     valid_count = 0
     for start in range(0, frames, batch_size):
         stop = min(start + batch_size, frames)
@@ -183,10 +195,21 @@ def depth_metrics_batched(
         aligned = np.clip(scale[:, None] * pred + shift[:, None], 1e-5, max_depth)
         safe_gt = np.where(valid, gt, 1.0)
         ratio = np.maximum(aligned / safe_gt, safe_gt / aligned)
-        abs_rel_sum += float((np.where(valid, np.abs(aligned - safe_gt) / safe_gt, 0.0)).sum())
+        diff = aligned - safe_gt
+        abs_rel_sum += float((np.where(valid, np.abs(diff) / safe_gt, 0.0)).sum())
+        sq_rel_sum += float((np.where(valid, diff**2 / safe_gt, 0.0)).sum())
+        squared_sum += float((np.where(valid, diff**2, 0.0)).sum())
+        log_squared_sum += float((np.where(valid, np.log(aligned / safe_gt)**2, 0.0)).sum())
+        mae_sum += float((np.where(valid, np.abs(diff), 0.0)).sum())
         delta_count += int((valid & (ratio < 1.25)).sum())
+        delta2_count += int((valid & (ratio < 1.25**2)).sum())
+        delta3_count += int((valid & (ratio < 1.25**3)).sum())
         valid_count += int(valid.sum())
-    return abs_rel_sum, float(delta_count), valid_count
+    return {"abs_rel": abs_rel_sum / valid_count, "sq_rel": sq_rel_sum / valid_count,
+            "rmse_m": float(np.sqrt(squared_sum / valid_count)), "rmse_log": float(np.sqrt(log_squared_sum / valid_count)),
+            "mae_m": mae_sum / valid_count, "delta_1_25_percent": 100 * delta_count / valid_count,
+            "delta_1_25_sq_percent": 100 * delta2_count / valid_count,
+            "delta_1_25_cu_percent": 100 * delta3_count / valid_count, "valid_depth_pixels": float(valid_count)}
 
 
 def geometry_metrics(
@@ -227,7 +250,10 @@ def forward(model, image_paths: list[str], device: torch.device, resolution: int
     depths = out["depth"][0, ..., 0].float().cpu().numpy()
     poses = None
     if "pose_enc" in out:
-        w2c, _ = pose_encoding_to_extri_intri(out["pose_enc"], out["images"].shape[-2:])
+        # Geometry post-processing uses matrix inversion, which is not
+        # implemented for bf16.  Keep the model forward in bf16 but promote
+        # only this small pose tensor for evaluation.
+        w2c, _ = pose_encoding_to_extri_intri(out["pose_enc"].float(), out["images"].shape[-2:])
         bottom = torch.zeros((*w2c.shape[:-2], 1, 4), device=w2c.device, dtype=w2c.dtype)
         bottom[..., 0, 3] = 1.0
         poses = torch.linalg.inv(torch.cat([w2c, bottom], dim=-2)[0]).float().cpu().numpy()
@@ -250,6 +276,8 @@ def main():
     a = args_parse()
     if a.timing_repeats < 1:
         raise ValueError("--timing-repeats must be positive")
+    if a.sampling_stride <= 0:
+        raise ValueError("--sampling-stride must be positive")
     device = torch.device(a.device)
     root = a.dataset_root or DATA_ROOTS[a.dataset]
     model = load_model(
@@ -265,6 +293,7 @@ def main():
         um_spatial_radius=a.um_spatial_radius,
         um_temporal_window=a.um_temporal_window,
         um_refresh_layers=a.um_refresh_layers,
+        model_bfloat16=a.model_bfloat16,
     )
     if a.acceleration_method == "sparse-vggt":
         sparse_root = Path("/data/mmc_syang/sparse-vggt/src")
@@ -289,15 +318,24 @@ def main():
         sequences = list(a.sequences) if a.sequences else sorted(path.name for path in root.iterdir() if (path / "images").is_dir() and (path / "depth").is_dir() and (path / "poses.txt").is_file())
     else:
         sequences = sequence_names(a.dataset, root, a.sequences, True, "test")
-    rows = []; pose_rows = []; total_ms = 0.0
+    rows = []; pose_rows = []; skipped_sequences = []; total_ms = 0.0
     for seq in sequences:
         all_images = sequence_images(a.dataset, root, seq)
+        if len(all_images) < a.num_frames:
+            skipped_sequences.append({"sequence": seq, "reason": "fewer_than_requested_frames", "available_frames": len(all_images)})
+            print(f"{seq}: skipped ({len(all_images)} < {a.num_frames} frames)")
+            continue
         if a.attention_probe_frame_gap is not None:
             if len(all_images) < 1 + 9 * a.attention_probe_frame_gap:
                 raise ValueError(f"{seq} has insufficient frames for attention-probe gap")
             images = all_images[0 : 1 + 9 * a.attention_probe_frame_gap : a.attention_probe_frame_gap]
         else:
-            images, source_indices, sampling_mode = compact_input_frames(all_images, a.num_frames, a.sampling_pool_frames)
+            if len(all_images) > a.sampling_stride * a.num_frames:
+                source_indices = list(range(0, a.sampling_stride * a.num_frames, a.sampling_stride))
+                images = [all_images[index] for index in source_indices]
+                sampling_mode = f"fixed_stride_{a.sampling_stride}_from_first"
+            else:
+                images, source_indices, sampling_mode = compact_input_frames(all_images, a.num_frames, a.sampling_pool_frames)
         depths = gt_depths(a.dataset, root, seq, images)
         gt_pose = sequence_poses(a.dataset, root, seq, len(images), images)
         # Untimed warmup, then formal CUDA Event measurements.
@@ -325,7 +363,7 @@ def main():
                     if a.acceleration_method == "da-vggt" else forward(model, images, device, a.image_resolution)); times.append((time.perf_counter()-t)*1000)
         latency = float(np.median(times)); total_ms += latency
         gt = np.stack([cv2.resize(read_depth(a.dataset, p), (width, height), interpolation=cv2.INTER_NEAREST) for p in depths])
-        abs_rel, delta, valid = depth_metrics_batched(pred, gt, MAX_DEPTHS[a.dataset])
+        depth_metric = depth_metrics_batched(pred, gt, MAX_DEPTHS[a.dataset])
         pose_metric = evaluate_pose_auc(pose, gt_pose) if pose is not None and gt_pose is not None else {"AUC@3": 0.0, "AUC@15": 0.0, "AUC@30": 0.0, "pose_errors_deg": [], "rotation_errors_deg": [], "translation_errors_deg": []}
         merge_stats = getattr(model.aggregator, "last_token_merging_stats", [])
         retention = (
@@ -333,17 +371,23 @@ def main():
             if merge_stats else 100.0
         )
         um_stats = [stat for stat in merge_stats if stat.get("mode") == "u-m"]
-        row = {"sequence": seq, "acceleration_method": a.acceleration_method, "abs_rel": abs_rel/valid, "delta_1_25_percent": 100*delta/valid, "auc_3_percent": pose_metric["AUC@3"], "auc_15_percent": pose_metric["AUC@15"], "auc_30_percent": pose_metric["AUC@30"], "model_latency_ms": latency, "fps": len(images)/(latency/1000), "frames": len(images), "sampling_mode": sampling_mode, "sampling_pool_frames_requested": a.sampling_pool_frames, "source_frame_indices": source_indices, "patch_retention_percent": retention, "um_edge_score_backend": um_stats[-1].get("um_edge_score_backend") if um_stats else None, "um_layer_retention_percent": [100.0 * float(stat["full_attention_token_ratio"]) for stat in um_stats], "depth_alignment": "per-frame-batched-irls-20x32768", "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / (1024**3) if device.type == "cuda" else None, "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / (1024**3) if device.type == "cuda" else None}
+        row = {"sequence": seq, "acceleration_method": a.acceleration_method, **depth_metric, "auc_3_percent": pose_metric["AUC@3"], "auc_5_percent": pose_metric["AUC@5"], "auc_10_percent": pose_metric["AUC@10"], "auc_15_percent": pose_metric["AUC@15"], "auc_30_percent": pose_metric["AUC@30"], "model_latency_ms": latency, "fps": len(images)/(latency/1000), "frames": len(images), "sampling_mode": sampling_mode, "sampling_pool_frames_requested": a.sampling_pool_frames, "source_frame_indices": source_indices, "patch_retention_percent": retention, "um_edge_score_backend": um_stats[-1].get("um_edge_score_backend") if um_stats else None, "um_layer_retention_percent": [100.0 * float(stat["full_attention_token_ratio"]) for stat in um_stats], "depth_alignment": "per-frame-batched-irls-20x32768", "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / (1024**3) if device.type == "cuda" else None, "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / (1024**3) if device.type == "cuda" else None}
         if pose is not None and gt_pose is not None:
             row.update(geometry_metrics(a.dataset, root, seq, pred, pose, gt, gt_pose))
+            pose_metric.update(trajectory_pose_metrics(pose, gt_pose))
         rows.append(row); pose_rows.append(pose_metric)
         print(f"{seq}: AbsRel={row['abs_rel']:.4f}, AUC@3={row['auc_3_percent']:.2f}, latency={latency:.1f}ms")
     pose_summary = summarize_pose_auc(pose_rows)
     valid_rows = rows
-    overall = {"abs_rel": float(np.mean([r["abs_rel"] for r in valid_rows])), "delta_1_25_percent": float(np.mean([r["delta_1_25_percent"] for r in valid_rows])), "auc_3_percent": pose_summary["AUC@3"], "auc_15_percent": pose_summary["AUC@15"], "auc_30_percent": pose_summary["AUC@30"], "model_latency_ms_mean": total_ms/len(rows), "fps": a.num_frames/(total_ms/len(rows)/1000), "peak_allocated_gib_max": float(np.max([r["peak_allocated_gib"] for r in valid_rows])) if device.type == "cuda" else None, "peak_reserved_gib_max": float(np.max([r["peak_reserved_gib"] for r in valid_rows])) if device.type == "cuda" else None}
+    overall = {key: float(np.mean([r[key] for r in valid_rows])) for key in ("abs_rel", "sq_rel", "rmse_m", "rmse_log", "mae_m", "delta_1_25_percent", "delta_1_25_sq_percent", "delta_1_25_cu_percent")}
+    overall.update({"auc_3_percent": pose_summary["AUC@3"], "auc_5_percent": pose_summary["AUC@5"], "auc_10_percent": pose_summary["AUC@10"], "auc_15_percent": pose_summary["AUC@15"], "auc_30_percent": pose_summary["AUC@30"], "model_latency_ms_mean": total_ms/len(rows), "fps": a.num_frames/(total_ms/len(rows)/1000), "peak_allocated_gib_max": float(np.max([r["peak_allocated_gib"] for r in valid_rows])) if device.type == "cuda" else None, "peak_reserved_gib_max": float(np.max([r["peak_reserved_gib"] for r in valid_rows])) if device.type == "cuda" else None})
+    overall["active_token_ratio_percent"] = float(np.mean([r["patch_retention_percent"] for r in valid_rows]))
+    overall["keep_ratio_percent"] = overall["active_token_ratio_percent"]
+    for key in ("ate_rmse_m", "are_deg", "rpe_translation_rmse_m", "rpe_rotation_rmse_deg", "rra_30_percent", "rta_30_percent"):
+        overall[key] = float(np.mean([row[key] for row in pose_rows]))
     for geometry_key in ("acc_mean_m", "acc_median_m", "comp_mean_m", "comp_median_m", "nc_mean", "nc_median", "chamfer_mean_m", "chamfer_median_m"):
         overall[geometry_key] = float(np.mean([r[geometry_key] for r in valid_rows if geometry_key in r]))
-    payload = {"protocol": {"dataset": a.dataset, "acceleration_method": a.acceleration_method, "num_frames_per_sequence": a.num_frames, "sampling_strategy": "uniform_pool_then_first" if a.sampling_pool_frames else "uniform", "sampling_pool_frames_requested": a.sampling_pool_frames, "timing": "cuda_event_median_after_warmup", "timing_repeats": a.timing_repeats}, "overall": overall, "per_sequence": rows}
+    payload = {"protocol": {"dataset": a.dataset, "acceleration_method": a.acceleration_method, "num_frames_per_sequence": a.num_frames, "sampling_stride": a.sampling_stride, "sampling_strategy": "uniform_pool_then_first" if a.sampling_pool_frames else "uniform", "sampling_pool_frames_requested": a.sampling_pool_frames, "timing": "cuda_event_median_after_warmup", "timing_repeats": a.timing_repeats}, "overall": overall, "per_sequence": rows, "skipped_sequences": skipped_sequences}
     a.output_dir.mkdir(parents=True, exist_ok=True); (a.output_dir / "metrics.json").write_text(json.dumps(payload, indent=2)); print(json.dumps(overall, indent=2))
 
 
