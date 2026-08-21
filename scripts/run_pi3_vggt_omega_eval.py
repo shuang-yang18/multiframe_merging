@@ -30,7 +30,7 @@ if str(ROOT) not in sys.path:
 SHARED_ROOT = Path("/data/mmc_syang")
 if str(SHARED_ROOT) not in sys.path:
     sys.path.insert(0, str(SHARED_ROOT))
-from geometry_eval import depth_to_world_points, evaluate_pi3_geometry, scaled_intrinsics
+from geometry_eval import depth_to_world_points, evaluate_pi3_geometry, scaled_intrinsics, trajectory_pose_metrics
 
 from pi3.models.pi3 import Pi3
 from utils.interfaces import load_and_resize14
@@ -54,6 +54,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretrained", default="checkpoints/Pi3")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-frames-per-seq", type=int, default=300)
+    parser.add_argument(
+        "--sampling-stride", type=int, default=3,
+        help="For sequences longer than stride * max-frames, select frames from index 0 at this fixed stride.",
+    )
     parser.add_argument("--frame-sample-mode", choices=["uniform", "first", "random"], default="uniform")
     parser.add_argument("--frame-sample-seed", type=int, default=0)
     parser.add_argument("--sampling-pool-frames", type=int, default=0,
@@ -349,6 +353,7 @@ def depth_metrics(prediction: np.ndarray, ground_truth: np.ndarray, max_depth: f
         "Sq Rel": float(np.mean((pred - gt) ** 2 / gt)),
         "RMSE": float(np.sqrt(np.mean((pred - gt) ** 2))),
         "Log RMSE": float(np.sqrt(np.mean((np.log(pred) - np.log(gt)) ** 2))),
+        "MAE": float(np.mean(np.abs(pred - gt))),
         "delta < 1.": float(np.mean(ratio < 1.0)),
         "delta < 1.25": float(np.mean(ratio < 1.25)),
         "delta < 1.25^2": float(np.mean(ratio < 1.25**2)),
@@ -408,7 +413,7 @@ def evaluate_pose_auc(pred_c2w: np.ndarray, gt_c2w: np.ndarray, args: argparse.N
     translation_errors = translation_error_deg(gt_rel[:, :3, 3], pred_rel[:, :3, 3])
     errors = np.maximum(rotation_errors, translation_errors)
     return {
-        "AUC@3": pose_auc(errors, 3), "AUC@15": pose_auc(errors, 15), "AUC@30": pose_auc(errors, 30),
+        "AUC@3": pose_auc(errors, 3), "AUC@5": pose_auc(errors, 5), "AUC@10": pose_auc(errors, 10), "AUC@15": pose_auc(errors, 15), "AUC@30": pose_auc(errors, 30),
         "frames": int(len(indices)), "pairs": int(len(errors)),
         "sampled_frame_indices": [int(index) for index in indices],
         "pose_eval_frames": int(args.pose_eval_frames), "pose_eval_seed": int(args.pose_eval_seed),
@@ -430,7 +435,7 @@ def summarize_pose(rows: list[dict]) -> dict:
     rotations = np.asarray([value for row in rows for value in row["rotation_errors_deg"]], dtype=np.float64)
     translations = np.asarray([value for row in rows for value in row["translation_errors_deg"]], dtype=np.float64)
     return {
-        "AUC@3": pose_auc(errors, 3), "AUC@15": pose_auc(errors, 15), "AUC@30": pose_auc(errors, 30), "sequences": len(rows), "pairs": int(len(errors)),
+        "AUC@3": pose_auc(errors, 3), "AUC@5": pose_auc(errors, 5), "AUC@10": pose_auc(errors, 10), "AUC@15": pose_auc(errors, 15), "AUC@30": pose_auc(errors, 30), "sequences": len(rows), "pairs": int(len(errors)),
         "mean_pose_error_deg": float(np.mean(errors)), "median_pose_error_deg": float(np.median(errors)),
         "mean_rotation_error_deg": float(np.mean(rotations)), "mean_translation_error_deg": float(np.mean(translations)),
         "pose_eval_frames": rows[0]["pose_eval_frames"], "pose_eval_seed": rows[0]["pose_eval_seed"],
@@ -510,6 +515,7 @@ def run_dataset(args: argparse.Namespace, model: Pi3, device: torch.device, data
     output_root = Path(args.output_dir) / dataset
     output_root.mkdir(parents=True, exist_ok=True)
     depth_rows, pose_rows = [], []
+    skipped_sequences = []
     total_time = 0.0
     total_frames = 0
     dtype = torch.bfloat16 if device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
@@ -526,13 +532,25 @@ def run_dataset(args: argparse.Namespace, model: Pi3, device: torch.device, data
             continue
 
         all_images = sequence_images(dataset, root, sequence)
+        if len(all_images) < args.max_frames_per_seq:
+            skipped_sequences.append({
+                "sequence": sequence,
+                "reason": "fewer_than_requested_frames",
+                "available_frames": len(all_images),
+            })
+            print(f"{sequence}: skipped ({len(all_images)} < {args.max_frames_per_seq} frames)")
+            continue
         if args.attention_probe_frame_gap is not None:
             gap = args.attention_probe_frame_gap
             if len(all_images) < 1 + 9 * gap:
                 raise ValueError(f"{sequence} has insufficient frames for attention-probe gap={gap}")
             images = all_images[0 : 1 + 9 * gap : gap]
         else:
-            if args.sampling_pool_frames:
+            if len(all_images) > args.sampling_stride * args.max_frames_per_seq:
+                source_indices = list(range(0, args.sampling_stride * args.max_frames_per_seq, args.sampling_stride))
+                images = [all_images[index] for index in source_indices]
+                sampling_mode = f"fixed_stride_{args.sampling_stride}_from_first"
+            elif args.sampling_pool_frames:
                 images, source_indices, sampling_mode = compact_input_frames(all_images, args.max_frames_per_seq, args.sampling_pool_frames)
             else:
                 images = limit_frames(all_images, args.max_frames_per_seq, args.frame_sample_mode, args.frame_sample_seed, sequence)
@@ -586,6 +604,13 @@ def run_dataset(args: argparse.Namespace, model: Pi3, device: torch.device, data
                       "source_frame_indices": source_indices,
                       "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / (1024**3) if device.type == "cuda" else None,
                       "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / (1024**3) if device.type == "cuda" else None})
+        token_stats = [dict(row) for row in model.last_token_merging_stats]
+        if args.acceleration_method == "u-m":
+            active_token_ratio_percent = None
+        elif token_stats:
+            active_token_ratio_percent = 100.0 * float(np.mean([row["full_attention_token_ratio"] for row in token_stats]))
+        else:
+            active_token_ratio_percent = 100.0
         if args.acceleration_method == "u-m":
             layer_stats = [dict(row) for row in model.last_um_layer_retention]
             retention = um_process_retention_percent(layer_stats, len(model.decoder) // 2)
@@ -595,8 +620,12 @@ def run_dataset(args: argparse.Namespace, model: Pi3, device: torch.device, data
                 "um_process_token_retention_percent": retention,
                 "um_process_token_compression_percent": None if retention is None else 100.0 - retention,
             })
+            active_token_ratio_percent = retention
+        depth["active_token_ratio_percent"] = active_token_ratio_percent
+        depth["keep_ratio_percent"] = active_token_ratio_percent
         depth.update(geometry_from_prediction(dataset, prediction, gt_depth, gt_poses, root, sequence))
         pose = evaluate_pose_auc(pred_poses, gt_poses, args, sequence)
+        pose.update(trajectory_pose_metrics(pred_poses, gt_poses))
         depth_rows.append(depth)
         pose_rows.append(pose)
         total_time += elapsed
@@ -611,7 +640,7 @@ def run_dataset(args: argparse.Namespace, model: Pi3, device: torch.device, data
                                               "source_frame_indices": source_indices}})
 
     weights = np.asarray([row["valid_pixels"] for row in depth_rows], dtype=np.float64)
-    metric_keys = ["Abs Rel", "Sq Rel", "RMSE", "Log RMSE", "delta < 1.", "delta < 1.25", "delta < 1.25^2", "delta < 1.25^3"]
+    metric_keys = ["Abs Rel", "Sq Rel", "RMSE", "Log RMSE", "MAE", "delta < 1.", "delta < 1.25", "delta < 1.25^2", "delta < 1.25^3"]
     depth_summary = {key: float(np.average([row[key] for row in depth_rows], weights=weights)) for key in metric_keys}
     pose_summary = summarize_pose(pose_rows)
     selected_method = args.acceleration_method if args.acceleration_method != "none" else args.token_merging_method
@@ -622,6 +651,8 @@ def run_dataset(args: argparse.Namespace, model: Pi3, device: torch.device, data
         "acceleration_method": selected_method,
         "token_merging_method": selected_method if selected_method == "fastvggt" else "none",
         "token_merging_ratio": args.token_merging_ratio if selected_method == "fastvggt" else None,
+        "sampling_stride": args.sampling_stride,
+        "skipped_sequences": skipped_sequences,
         "auc_15_percent": pose_summary.get("AUC@15", 0.0),
         "peak_allocated_gib_max": float(np.max([row["peak_allocated_gib"] for row in depth_rows])) if device.type == "cuda" else None,
         "peak_reserved_gib_max": float(np.max([row["peak_reserved_gib"] for row in depth_rows])) if device.type == "cuda" else None,
@@ -635,15 +666,24 @@ def run_dataset(args: argparse.Namespace, model: Pi3, device: torch.device, data
     complete = {"video_depth": depth_summary, "pose_auc": pose_summary, "speed": {"frames": total_frames, "time": total_time, "fps": depth_summary["fps"]}}
     complete["overall"] = {
         "abs_rel": depth_summary["Abs Rel"],
+        "sq_rel": depth_summary["Sq Rel"], "rmse_m": depth_summary["RMSE"],
+        "rmse_log": depth_summary["Log RMSE"], "mae_m": depth_summary["MAE"],
         "delta_1_25_percent": 100.0 * depth_summary["delta < 1.25"],
+        "delta_1_25_sq_percent": 100.0 * depth_summary["delta < 1.25^2"],
+        "delta_1_25_cu_percent": 100.0 * depth_summary["delta < 1.25^3"],
         "auc_3_percent": pose_summary.get("AUC@3", 0.0),
+        "auc_5_percent": pose_summary.get("AUC@5", 0.0), "auc_10_percent": pose_summary.get("AUC@10", 0.0),
         "auc_15_percent": pose_summary.get("AUC@15", 0.0),
         "auc_30_percent": pose_summary.get("AUC@30", 0.0),
         "model_latency_ms_mean": 1000.0 * total_time / max(len(depth_rows), 1),
         "fps": depth_summary["fps"],
         "peak_allocated_gib_max": depth_summary["peak_allocated_gib_max"],
         "peak_reserved_gib_max": depth_summary["peak_reserved_gib_max"],
+        "active_token_ratio_percent": float(np.mean([row["active_token_ratio_percent"] for row in depth_rows])),
+        "keep_ratio_percent": float(np.mean([row["keep_ratio_percent"] for row in depth_rows])),
     }
+    for key in ("ate_rmse_m", "are_deg", "rpe_translation_rmse_m", "rpe_rotation_rmse_deg", "rra_30_percent", "rta_30_percent"):
+        complete["overall"][key] = float(np.mean([row[key] for row in pose_rows]))
     complete["overall"].update({key: depth_summary[key] for key in ("acc_mean_m", "acc_median_m", "comp_mean_m", "comp_median_m", "nc_mean", "nc_median", "chamfer_mean_m", "chamfer_median_m")})
     if selected_method == "u-m":
         complete["overall"].update({
@@ -651,15 +691,19 @@ def run_dataset(args: argparse.Namespace, model: Pi3, device: torch.device, data
             "um_process_token_compression_percent": depth_summary["um_process_token_compression_percent"],
         })
     complete["per_sequence"] = depth_rows
+    complete["skipped_sequences"] = skipped_sequences
     write_csv(output_root / "_sequence_metrics_scale_shift.csv", depth_rows)
     write_json(output_root / "_summary_scale_shift.json", depth_summary)
     write_json(output_root / "_summary_pose_auc.json", pose_summary)
     write_json(output_root / "_summary_complete_scale_shift.json", complete)
+    write_json(output_root / "metrics.json", complete)
     print(json.dumps(complete, indent=2))
 
 
 def main() -> None:
     args = parse_args()
+    if args.sampling_stride <= 0:
+        raise ValueError("--sampling-stride must be positive")
     device = torch.device(args.device)
     model = build_model(args, device)
     for dataset in ("tum_dynamic", "7scenes", "nrgbd", "scannet") if args.dataset == "all" else (args.dataset,):
