@@ -1,0 +1,1 @@
+"""VGGT Python package."""

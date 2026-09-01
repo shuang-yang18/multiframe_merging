@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -20,7 +21,7 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-SHARED_ROOT = Path("/data/mmc_syang")
+SHARED_ROOT = Path(os.environ.get("MMC_SYANG_ROOT", ROOT.parent))
 if str(SHARED_ROOT) not in sys.path:
     sys.path.insert(0, str(SHARED_ROOT))
 
@@ -59,7 +60,7 @@ def args_parse():
     p.add_argument("--overwrite", action="store_true")
     p.add_argument(
         "--acceleration-method",
-        choices=("none", "fastvggt", "sparse-vggt", "da-vggt", "u-m"),
+        choices=("none", "fastvggt", "sparse-vggt", "da-vggt", "u-m", "avggt"),
         default="none",
         help="Unified acceleration selector. The legacy FastVGGT configuration is retained for compatibility.",
     )
@@ -71,6 +72,8 @@ def args_parse():
     p.add_argument("--um-spatial-radius", type=int, default=2)
     p.add_argument("--um-temporal-window", type=int, default=4)
     p.add_argument("--um-refresh-layers", default="0,9,21")
+    p.add_argument("--avggt-subsample-factor", type=int, choices=(2, 4, 6, 9), default=4,
+                   help="Paper AVGGT factor σ; AVGGT fixes early G2F at global blocks 0--8.")
     p.add_argument(
         "--model-bfloat16", dest="model_bfloat16", action="store_true", default=True,
         help="Use the default full-model bf16 inference path.",
@@ -244,7 +247,10 @@ def geometry_metrics(
 
 
 def forward(model, image_paths: list[str], device: torch.device, resolution: int):
-    images = load_and_preprocess_images(image_paths, mode="crop", target_size=resolution).to(device)
+    input_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    images = load_and_preprocess_images(image_paths, mode="crop", target_size=resolution).to(
+        device=device, dtype=input_dtype
+    )
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
         out = model(images)
     depths = out["depth"][0, ..., 0].float().cpu().numpy()
@@ -262,7 +268,10 @@ def forward(model, image_paths: list[str], device: torch.device, resolution: int
 
 def forward_da(model, image_paths: list[str], device: torch.device, resolution: int, chunk_size: int):
     """Full native DA-VGGT: cached DINO, pose-weighted rechunking, token reuse."""
-    images = load_and_preprocess_images(image_paths, mode="crop", target_size=resolution).to(device)
+    input_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    images = load_and_preprocess_images(image_paths, mode="crop", target_size=resolution).to(
+        device=device, dtype=input_dtype
+    )
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
         out = model.forward_da_vggt(images, chunk_size=chunk_size)
     depths = out["depth"][0, ..., 0].float().cpu().numpy()
@@ -293,11 +302,17 @@ def main():
         um_spatial_radius=a.um_spatial_radius,
         um_temporal_window=a.um_temporal_window,
         um_refresh_layers=a.um_refresh_layers,
+        avggt_subsample_factor=a.avggt_subsample_factor if a.acceleration_method == "avggt" else None,
         model_bfloat16=a.model_bfloat16,
     )
     if a.acceleration_method == "sparse-vggt":
-        sparse_root = Path("/data/mmc_syang/sparse-vggt/src")
-        sparge_root = Path("/data/mmc_syang/sparse-vggt/external/SpargeAttn")
+        # Keep the external Sparse-VGGT checkout configurable: experiment
+        # machines use different workspace roots (for example NEED/ on 5090).
+        sparse_checkout = Path(
+            os.environ.get("SPARSE_VGGT_ROOT", "/data/mmc_syang/sparse-vggt")
+        ).expanduser()
+        sparse_root = sparse_checkout / "src"
+        sparge_root = sparse_checkout / "external" / "SpargeAttn"
         if not sparse_root.is_dir():
             raise FileNotFoundError(f"Sparse-VGGT source not found: {sparse_root}")
         if not sparge_root.is_dir():
@@ -371,7 +386,8 @@ def main():
             if merge_stats else 100.0
         )
         um_stats = [stat for stat in merge_stats if stat.get("mode") == "u-m"]
-        row = {"sequence": seq, "acceleration_method": a.acceleration_method, **depth_metric, "auc_3_percent": pose_metric["AUC@3"], "auc_5_percent": pose_metric["AUC@5"], "auc_10_percent": pose_metric["AUC@10"], "auc_15_percent": pose_metric["AUC@15"], "auc_30_percent": pose_metric["AUC@30"], "model_latency_ms": latency, "fps": len(images)/(latency/1000), "frames": len(images), "sampling_mode": sampling_mode, "sampling_pool_frames_requested": a.sampling_pool_frames, "source_frame_indices": source_indices, "patch_retention_percent": retention, "um_edge_score_backend": um_stats[-1].get("um_edge_score_backend") if um_stats else None, "um_layer_retention_percent": [100.0 * float(stat["full_attention_token_ratio"]) for stat in um_stats], "depth_alignment": "per-frame-batched-irls-20x32768", "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / (1024**3) if device.type == "cuda" else None, "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / (1024**3) if device.type == "cuda" else None}
+        avggt_stats = [stat for stat in merge_stats if stat.get("mode") == "avggt"]
+        row = {"sequence": seq, "acceleration_method": a.acceleration_method, **depth_metric, "auc_3_percent": pose_metric["AUC@3"], "auc_5_percent": pose_metric["AUC@5"], "auc_10_percent": pose_metric["AUC@10"], "auc_15_percent": pose_metric["AUC@15"], "auc_30_percent": pose_metric["AUC@30"], "model_latency_ms": latency, "fps": len(images)/(latency/1000), "frames": len(images), "sampling_mode": sampling_mode, "sampling_pool_frames_requested": a.sampling_pool_frames, "source_frame_indices": source_indices, "patch_retention_percent": retention, "um_edge_score_backend": um_stats[-1].get("um_edge_score_backend") if um_stats else None, "um_layer_retention_percent": [100.0 * float(stat["full_attention_token_ratio"]) for stat in um_stats], "avggt_early_global_blocks": 9 if avggt_stats else None, "avggt_subsample_factor": a.avggt_subsample_factor if avggt_stats else None, "avggt_reference_frame_uncompressed": True if avggt_stats else None, "avggt_diagonal_preservation": True if avggt_stats else None, "avggt_mean_fill": True if avggt_stats else None, "depth_alignment": "per-frame-batched-irls-20x32768", "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / (1024**3) if device.type == "cuda" else None, "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / (1024**3) if device.type == "cuda" else None}
         if pose is not None and gt_pose is not None:
             row.update(geometry_metrics(a.dataset, root, seq, pred, pose, gt, gt_pose))
             pose_metric.update(trajectory_pose_metrics(pose, gt_pose))

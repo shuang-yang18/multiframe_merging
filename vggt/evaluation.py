@@ -213,6 +213,7 @@ def load_model(
     um_spatial_radius: int = 2,
     um_temporal_window: int = 4,
     um_refresh_layers: str = "0,9,21",
+    avggt_subsample_factor: int | None = None,
     model_bfloat16: bool = True,
 ) -> VGGT:
     checkpoint_path = Path(checkpoint_path)
@@ -244,6 +245,7 @@ def load_model(
             um_spatial_radius=um_spatial_radius,
             um_temporal_window=um_temporal_window,
             um_refresh_layers=um_refresh_layers,
+            avggt_subsample_factor=avggt_subsample_factor,
         ).eval()
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if isinstance(state, dict) and "state_dict" in state:

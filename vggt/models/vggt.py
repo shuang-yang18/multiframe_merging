@@ -4,10 +4,13 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 import numpy as np
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from vggt.models.aggregator import Aggregator
 from vggt.models.da_vggt import cosine_similarity, diversity_partition, pseudo_positions, pose_weighted_similarity
@@ -46,6 +49,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         um_spatial_radius: int = 2,
         um_temporal_window: int = 4,
         um_refresh_layers: str = "0,9,21",
+        avggt_subsample_factor: int | None = None,
     ):
         super().__init__()
         self.explicit_bfloat16_inference = False
@@ -73,6 +77,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             um_spatial_radius=um_spatial_radius,
             um_temporal_window=um_temporal_window,
             um_refresh_layers=um_refresh_layers,
+            avggt_subsample_factor=avggt_subsample_factor,
         )
 
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
@@ -112,7 +117,13 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+        sdpa_context = (
+            sdpa_kernel(SDPBackend.FLASH_ATTENTION)
+            if images.is_cuda
+            else nullcontext()
+        )
+        with sdpa_context:
+            aggregated_tokens_list, patch_start_idx = self.aggregator(images)
 
         predictions = {}
 

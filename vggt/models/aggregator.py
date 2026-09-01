@@ -24,7 +24,7 @@ from vggt.models.acceleration import (
     parse_layer_ratio_schedule,
     restore_frames,
 )
-from vggt.models.unified_um import build_um_plan as build_unified_um_plan, um_attention as unified_um_attention
+from vggt.models.avggt import avggt_attention, build_avggt_sampling_plan
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +98,7 @@ class Aggregator(nn.Module):
         um_spatial_radius: int = 2,
         um_temporal_window: int = 4,
         um_refresh_layers: str = "0,9,21",
+        avggt_subsample_factor: int | None = None,
     ):
         super().__init__()
 
@@ -170,6 +171,10 @@ class Aggregator(nn.Module):
         self.um_temporal_window = int(um_temporal_window)
         self.um_refresh_layers = parse_block_indices(um_refresh_layers, depth) if um_lambda_cost is not None else set()
         self._um_plan = None
+        if avggt_subsample_factor is not None and avggt_subsample_factor not in (2, 4, 6, 9):
+            raise ValueError("AVGGT subsample factor must be one of 2, 4, 6, 9")
+        self.avggt_subsample_factor = avggt_subsample_factor
+        self.avggt_early_global_blocks = 9
 
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
@@ -276,6 +281,7 @@ class Aggregator(nn.Module):
 
         normalized = (images - self._resnet_mean) / self._resnet_std
         patch_tokens = self.patch_embed(normalized.view(B * S, C_in, H, W))
+        del normalized
 
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
@@ -318,26 +324,36 @@ class Aggregator(nn.Module):
         global_idx = 0
         output_list = []
         self._um_plan = None
+        self.last_token_merging_stats = []
         frame_merge_states: list[FrameMergeState] | None = None
         active_frames = S
 
         for _ in range(self.aa_block_num):
+            first_layer_idx = len(output_list)
+            layer_indices = range(first_layer_idx, first_layer_idx + self.aa_block_size)
+            need_intermediates = any(
+                layer_idx in self.cached_layer_indices for layer_idx in layer_indices
+            )
             for attn_type in self.aa_order:
                 if attn_type == "frame":
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
-                        tokens, B, active_frames, P, C, frame_idx, pos=pos
+                        tokens, B, active_frames, P, C, frame_idx, pos=pos,
+                        need_intermediates=need_intermediates,
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
                         tokens, B, active_frames, P, C, global_idx, pos=pos,
                         patch_grid_size=(H // self.patch_size, W // self.patch_size),
+                        need_intermediates=need_intermediates,
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
 
-            for i in range(len(frame_intermediates)):
+            for i in range(self.aa_block_size):
                 layer_idx = len(output_list)
                 if layer_idx in self.cached_layer_indices:
+                    if frame_intermediates is None or global_intermediates is None:
+                        raise RuntimeError(f"Missing required intermediate layer {layer_idx}")
                     # concat frame and global intermediates, [B x S x P x 2C]
                     frame_output = frame_intermediates[i]
                     global_output = global_intermediates[i]
@@ -406,7 +422,9 @@ class Aggregator(nn.Module):
         del global_intermediates
         return output_list, self.patch_start_idx
 
-    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
+    def _process_frame_attention(
+        self, tokens, B, S, P, C, frame_idx, pos=None, need_intermediates: bool = True
+    ):
         """
         Process frame attention blocks. We keep tokens in shape (B*S, P, C).
         """
@@ -417,7 +435,7 @@ class Aggregator(nn.Module):
         if pos is not None and pos.shape != (B * S, P, 2):
             pos = pos.view(B, S, P, 2).view(B * S, P, 2)
 
-        intermediates = []
+        intermediates = [] if need_intermediates else None
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
@@ -426,11 +444,15 @@ class Aggregator(nn.Module):
             else:
                 tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
             frame_idx += 1
-            intermediates.append(tokens.view(B, S, P, C))
+            if intermediates is not None:
+                intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, patch_grid_size=None):
+    def _process_global_attention(
+        self, tokens, B, S, P, C, global_idx, pos=None, patch_grid_size=None,
+        need_intermediates: bool = True,
+    ):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
         """
@@ -440,7 +462,7 @@ class Aggregator(nn.Module):
         if pos is not None and pos.shape != (B, S * P, 2):
             pos = pos.view(B, S, P, 2).view(B, S * P, 2)
 
-        intermediates = []
+        intermediates = [] if need_intermediates else None
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
@@ -452,9 +474,58 @@ class Aggregator(nn.Module):
                 and merge_ratio > 0.0
             )
             use_um = self.um_lambda_cost is not None
-            if block_idx in self.skip_global_attention_blocks:
+            use_avggt = self.avggt_subsample_factor is not None
+            if use_avggt and (self.enable_token_merging or use_um):
+                raise ValueError("AVGGT cannot be combined with token merging or U-M")
+            if use_avggt and block_idx < self.avggt_early_global_blocks:
+                # AVGGT G2F: retain the global block weights but apply them
+                # independently to each frame.
+                frame_tokens = tokens.view(B, S, P, C).reshape(B * S, P, C)
+                frame_pos = pos.view(B, S, P, 2).reshape(B * S, P, 2) if pos is not None else None
+                tokens = self.global_blocks[block_idx](frame_tokens, pos=frame_pos).view(B, S, P, C)
+            elif use_avggt:
+                plan = build_avggt_sampling_plan(
+                    num_frames=S,
+                    tokens_per_frame=P,
+                    patch_start=self.patch_start_idx,
+                    grid_size=patch_grid_size,
+                    subsample_factor=self.avggt_subsample_factor,
+                    device=tokens.device,
+                )
+                residual = avggt_attention(
+                    self.global_blocks[block_idx].attn,
+                    self.global_blocks[block_idx].norm1(tokens),
+                    pos,
+                    plan,
+                )
+                tokens = tokens + self.global_blocks[block_idx].ls1(residual)
+                tokens = tokens + self.global_blocks[block_idx].ls2(
+                    self.global_blocks[block_idx].mlp(self.global_blocks[block_idx].norm2(tokens))
+                )
+                self.last_token_merging_stats.append(
+                    {
+                        "block": block_idx,
+                        "mode": "avggt",
+                        "original_tokens": plan.total_tokens,
+                        "active_tokens": plan.selected_tokens,
+                        "full_attention_token_ratio": plan.selected_tokens / plan.total_tokens,
+                        "merged_away_token_ratio": 1.0 - plan.selected_tokens / plan.total_tokens,
+                        "avggt_subsample_factor": self.avggt_subsample_factor,
+                        "avggt_reference_frame_uncompressed": True,
+                        "avggt_diagonal_preservation": True,
+                        "avggt_mean_fill": True,
+                    }
+                )
+                tokens = tokens.view(B, S, P, C)
+            elif block_idx in self.skip_global_attention_blocks:
                 tokens = tokens.view(B, S, P, C)
             elif use_um:
+                # U-M is optional.  Import its Pi3-backed adapter only when the
+                # method is selected, so baseline/FastVGGT do not require Pi3.
+                from vggt.models.unified_um import (
+                    build_um_plan as build_unified_um_plan,
+                    um_attention as unified_um_attention,
+                )
                 if self._um_plan is None or block_idx in self.um_refresh_layers:
                     self._um_plan = build_unified_um_plan(
                         tokens,
@@ -510,7 +581,8 @@ class Aggregator(nn.Module):
             else:
                 tokens = self.global_blocks[global_idx](tokens, pos=pos)
             global_idx += 1
-            intermediates.append(tokens.view(B, S, P, C))
+            if intermediates is not None:
+                intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, global_idx, intermediates
 
