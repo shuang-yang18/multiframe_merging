@@ -6,12 +6,21 @@ pre-QKV group averaging, and Triton fused edge-cost fallback.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
-_PI3_ROOT = Path("/data/mmc_syang/Pi3")
-if _PI3_ROOT.is_dir() and str(_PI3_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PI3_ROOT))
+_PI3_ROOT_CANDIDATES = (
+    os.environ.get("PI3_ROOT"),
+    "/data/mmc_syang/Pi3",
+    Path(__file__).resolve().parents[3] / "Pi3",
+)
+for _pi3_root in _PI3_ROOT_CANDIDATES:
+    if _pi3_root is not None and Path(_pi3_root).is_dir():
+        _pi3_root = str(_pi3_root)
+        if _pi3_root not in sys.path:
+            sys.path.insert(0, _pi3_root)
+        break
 
 from pi3.models.um import UMPlan, build_um_plan as _build_um_plan, um_attention as _um_attention
 
